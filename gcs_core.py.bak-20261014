@@ -1,0 +1,3907 @@
+#!/usr/bin/env python3
+"""
+================================================================================
+  CanSat 2027 Ground Control Station — Team 1059 — core (no UI)
+  Container (1059C) + PocketQube (1059P), dual-band parallel telemetry
+================================================================================
+  Origin: GCS2027.py (Tkinter). The constants, parsing helpers, LinkReader,
+  LinkManager, VirtualPayload, SimpProfileSender, ApogeeTracker and
+  pq_state_from_packet below are copied unchanged from that file.
+  GroundStation (at the bottom) is the non-UI half of the old GCSApp; main.py
+  serves it to browsers over FastAPI + WebSockets.
+================================================================================
+  The two radios are co-equal parallel links (900 MHz + 2.4 GHz) — no primary/backup.
+  The operator chooses which link to *view* (XBee / ESPNOW / Merged), but
+  **uplink commands still go out on the single selected link only** to avoid double execution.
+================================================================================
+"""
+import asyncio
+import collections
+import concurrent.futures
+import csv
+import datetime
+import io
+import json
+import math
+import os
+import queue
+import sqlite3
+import statistics
+import tempfile
+import threading
+import time
+import urllib.request
+
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_OK = True
+except ImportError:          # the GCS still runs (virtual payload) without pyserial
+    serial = None
+    SERIAL_OK = False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Constants
+# ══════════════════════════════════════════════════════════════════════════════
+
+TEAM_ID = 1059
+CONTAINER_ID = f"{TEAM_ID}C"
+PQ_ID = f"{TEAM_ID}P"
+
+# ── Two radios: parallel, co-equal, no primary/backup ─────────────────────────
+RADIOS = ("XBEE", "ESPNOW")
+RADIO_LABEL = {"XBEE": "XBee 900 MHz", "ESPNOW": "ESPNOW 2.4 GHz"}
+RADIO_SUFFIX = {"XBEE": "XBEE", "ESPNOW": "ESP"}
+VEHICLE_PREFIX = {"C": "CONT", "P": "PQ"}
+VEHICLE_NAME = {"C": "CONTAINER", "P": "POCKETQUBE"}
+
+LINK_KEYS = ("CONT_XBEE", "PQ_XBEE", "CONT_ESP", "PQ_ESP")
+
+# Data source used for "display" — switchable live, no restart needed
+DISPLAY_SOURCES = ("MERGED", "XBEE", "ESPNOW")
+DISPLAY_SOURCE_LABEL = {
+    "MERGED": "Merged (first copy wins)",
+    "XBEE": "XBee 900 MHz only",
+    "ESPNOW": "ESPNOW 2.4 GHz only",
+}
+
+
+def link_key(vehicle, radio):
+    """('C', 'XBEE') -> 'CONT_XBEE'"""
+    return f"{VEHICLE_PREFIX[vehicle]}_{RADIO_SUFFIX[radio]}"
+
+
+DEFAULT_LINKS = {
+    "CONT_XBEE": dict(vehicle="C", radio="XBEE", port="", baud=9600,
+                      channel="A", netid=str(TEAM_ID), peer_mac=""),
+    "PQ_XBEE":   dict(vehicle="P", radio="XBEE", port="", baud=9600,
+                      channel="B", netid=str(TEAM_ID), peer_mac=""),
+    "CONT_ESP":  dict(vehicle="C", radio="ESPNOW", port="", baud=115200,
+                      channel="1", netid="", peer_mac=""),
+    "PQ_ESP":    dict(vehicle="P", radio="ESPNOW", port="", baud=115200,
+                      channel="6", netid="", peer_mac=""),
+}
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(APP_DIR, "radio_config.json")
+
+MAP_DB_PATH = os.path.join(APP_DIR, "map_cache.db")
+
+BROADCAST_MAC = "FF:FF:FF:FF:FF:FF"
+ESPNOW_CLEAN_CHANNELS = {"1", "6", "11"}
+
+MAP_TILE_SERVER = ("https://mt0.google.com/vt/lyrs=s&hl=en"
+                   "&x={x}&y={y}&z={z}&s=Ga")
+MAP_HOME = (14.650934, 101.186791)
+
+# Count tiles in the cache — constant query, no string building from external values
+SQL_TILE_COUNT = "SELECT COUNT(*) FROM tiles"
+
+# ── Telemetry schemas ─────────────────────────────────────────────────────────
+CONTAINER_FIELDS = [
+    "ID", "MISSION_TIME", "PACKET_COUNT", "COMMAND_COUNT", "MODE", "ALTITUDE",
+    "PRESSURE", "TEMPERATURE", "BATT_V", "BATT_I", "MECH_STATE", "STATE",
+    "CMD_ECHO",
+]
+
+# PQ_FIELDS ends at CMD_ECHO; IMAGE_STABILIZATION and SCIENCE_EXP are
+# trailing fields of variable count (team-defined) — stored as a list
+PQ_FIELDS = [
+    "ID", "MODE", "MISSION_TIME", "PACKET_COUNT", "COMMAND_COUNT", "ALTITUDE",
+    "TEMPERATURE", "PRESSURE", "VOLTAGE", "CURRENT", "GNSS_TIME",
+    "GNSS_ALTITUDE", "GNSS_LATITUDE", "GNSS_LONGITUDE", "GNSS_SATS",
+    "ROT_RATE_X", "ROT_RATE_Y", "ROT_RATE_Z", "ACCEL_X", "ACCEL_Y", "ACCEL_Z",
+    "MAG_X", "MAG_Y", "MAG_Z", "SOLAR_1", "SOLAR_2", "MECH_STATE", "CMD_ECHO",
+]
+PQ_TRAILING = ["IMAGE_STABILIZATION", "SCIENCE_EXP"]
+
+# Used only for naming CSV columns — number of image-stabilisation fields the FSW sends
+IMAGE_STAB_FIELD_COUNT = 1
+
+# display decimals per field (from the resolution in the spec)
+DECIMALS = {
+    "ALTITUDE": 1, "PRESSURE": 0, "TEMPERATURE": 1,
+    "BATT_V": 1, "BATT_I": 0, "VOLTAGE": 1, "CURRENT": 0,
+    "ROT_RATE_X": 1, "ROT_RATE_Y": 1, "ROT_RATE_Z": 1,
+    "ACCEL_X": 3, "ACCEL_Y": 3, "ACCEL_Z": 3,
+    "MAG_X": 0, "MAG_Y": 0, "MAG_Z": 0,
+    "SOLAR_1": 2, "SOLAR_2": 2,
+    "GNSS_ALTITUDE": 1, "GNSS_LATITUDE": 6, "GNSS_LONGITUDE": 6,
+}
+UNITS = {
+    "ALTITUDE": "m", "PRESSURE": "Pa", "TEMPERATURE": "C",
+    "BATT_V": "V", "BATT_I": "mA", "VOLTAGE": "V", "CURRENT": "mA",
+    "ROT_RATE_X": "deg/s", "ROT_RATE_Y": "deg/s", "ROT_RATE_Z": "deg/s",
+    "ACCEL_X": "m/s2", "ACCEL_Y": "m/s2", "ACCEL_Z": "m/s2",
+    "MAG_X": "mGauss", "MAG_Y": "mGauss", "MAG_Z": "mGauss",
+    "SOLAR_1": "V", "SOLAR_2": "V",
+    "GNSS_ALTITUDE": "m", "GNSS_LATITUDE": "deg", "GNSS_LONGITUDE": "deg",
+}
+
+# ── MECH_STATE bit maps ───────────────────────────────────────────────────────
+MECH_BITS = {
+    "C": [(0, "Deployment mech activated"), (1, "PocketQube released")],
+    "P": [(0, "Solar panel 1 deployed"), (1, "Solar panel 2 deployed"),
+          (2, "Boom deployed"), (3, "Camera recording")],
+}
+# Bit names referenced by the PQ state machine — change them here only
+PQ_BIT_SOLAR_1 = 0
+PQ_BIT_SOLAR_2 = 1
+PQ_BIT_BOOM = 2
+PQ_BIT_CAM_REC = 3
+C_BIT_MECH_ACTIVE = 0
+C_BIT_PQ_RELEASED = 1
+
+# ── State machines ────────────────────────────────────────────────────────────
+CONTAINER_STATES = ["LAUNCH_PAD", "ASCENT", "APOGEE", "PQ_RELEASE", "LANDED"]
+PQ_STATES = ["RELEASED", "SOLAR_DEPLOY", "BOOM_DEPLOY", "CAMERA_TURN", "LANDED"]
+
+STATE_COLORS = {
+    "LAUNCH_PAD":   "#f0a30a",
+    "ASCENT":       "#e06c00",
+    "APOGEE":       "#c62828",
+    "PQ_RELEASE":   "#6a1b9a",
+    "RELEASED":     "#6a1b9a",
+    "SOLAR_DEPLOY": "#0277bd",
+    "BOOM_DEPLOY":  "#00838f",
+    "CAMERA_TURN":  "#2e7d32",
+    "LANDED":       "#1b5e20",
+}
+
+# tooltip / timeline text from FSW 2027
+STATE_HINT = {
+    "LAUNCH_PAD":   "Awaiting commands / launch — CLR → ST → CAL → ARM ON",
+    "ASCENT":       "Ascent detected via barometer + IMU, telemetry 4 Hz",
+    "APOGEE":       "Peak altitude captured, 90% of apogee computed",
+    "PQ_RELEASE":   "PocketQube released at 90% apogee (micro switch); telemetry 4 Hz -> 1 Hz 5 s later",
+    "RELEASED":     "PQ separated — power on, camera on, telemetry 4 Hz",
+    "SOLAR_DEPLOY": "Solar panels deployed (MECH_STATE bit 0 / bit 1)",
+    "BOOM_DEPLOY":  "Boom actually deployed (MECH_STATE bit 2) — not just commanded",
+    "CAMERA_TURN":  "Camera rotated from nadir to 90 degrees via CAM_SET",
+    "LANDED":       "Landed — CSV/video saved to SD card",
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ┌──────────────────────────────────────────────────────────────────────────┐
+#  │  COMMAND WIRE FORMAT — per the FSW SPEC.md (§5.10 / §9)                  │
+#  ├──────────────────────────────────────────────────────────────────────────┤
+#  │  CMD,<TEAM>,<NAME>[,<ARG1>[,<ARG2>]]  <TEAM> = 1059C / 1059P             │
+#  │  (X5: selected vehicle only). All go through wire_commands().            │
+#  │  Some button names (BOOM_ON, SOLAR_ON, CAM_SET) are internal —           │
+#  │  mapped to MEC,... in WIRE_ALIASES. Open in SPEC (§13 items 8/11):       │
+#  │  MEC,ROT angle arg format — confirm with firmware before flight.         │
+#  └──────────────────────────────────────────────────────────────────────────┘
+# ══════════════════════════════════════════════════════════════════════════════
+COMMAND_WIRE_TEMPLATE = "CMD,<TEAM>,<BODY>"
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+# Mission Guide (line 1184) — "shall support the following commands as a minimum":
+#     SIM, SIMP, CAL, ARM, MEC        <- mandatory (marked required=True)
+# Teams may define further commands per the spec (Additional commands are permitted).
+#
+# Command set per SPEC §9: CX, ST, SIM, SIMP, CAL, ARM, MEC, CLR. The Mission Guide
+# and SPEC both use the name "MEC" (old slides said "MAC" — removed).
+# FLIGHT ENABLE/ACTIVATE/DISABLE are not in SPEC (FSW starts in flight by default and
+# leaves sim via SIM DISABLE) — they are GS mode-sequence buttons only, never sent.
+# CX ON/OFF have no buttons (operator request); typed CMD,...,CX,ON still goes out.
+#
+# arg: None | 'time' | 'angle' | 'pascals' | 'mech'
+COMMAND_GROUPS = [
+    ("Setup", [
+        dict(name="ST",        targets="CP", arg="time",
+             desc="Set time — GPS (time from the vehicle's GNSS telemetry) or manual HH:MM:SS"),
+        dict(name="CAL",       targets="C",  arg=None, required=True,
+             desc="[Required] Calibrate sensors / set 0 altitude (container)"),
+        dict(name="ARM ON",    targets="C",  arg=None, required=True,
+             desc="[Required] Activate container launch detection"),
+        dict(name="ARM OFF",   targets="C",  arg=None,
+             desc="Disable launch detection (launch pad only)"),
+        dict(name="CLR",       targets="CP", arg=None, destructive=True,
+             desc="Clear persisted data + reset FSM (pad only, not ARMed)"),
+    ]),
+    ("Flight", [
+        dict(name="FLIGHT ENABLE",   targets="CP", arg=None, local=True,
+             desc="After SIM: select FLIGHT mode (not sent — FSW starts in flight)"),
+        dict(name="FLIGHT ACTIVATE", targets="CP", arg=None, local=True,
+             desc="After FLIGHT ENABLE: start showing real flight telemetry (not sent)"),
+        dict(name="FLIGHT DISABLE",  targets="CP", arg=None, local=True,
+             desc="Leave FLIGHT mode and stop the telemetry display (not sent)"),
+    ]),
+    ("Mechanisms", [
+        dict(name="MEC", targets="CP", arg="mech", destructive=True,
+             action="MECH", required=True,
+             desc="[Required · Mission Guide] Control a mechanism"),
+        dict(name="MEC RELEASE ON",  targets="C", arg=None, destructive=True,
+             desc="Release the PocketQube manually (any state — emergency)"),
+        dict(name="MEC RELEASE OFF", targets="C", arg=None,
+             desc="Retract the release mechanism (pad only)"),
+        dict(name="MEC CAM ON",  targets="CP", arg=None,
+             desc="Camera on"),
+        dict(name="MEC CAM OFF", targets="CP", arg=None,
+             desc="Camera off"),
+        dict(name="SOLAR_ON",  targets="P", arg=None, destructive=True,
+             desc="Deploy solar panels 1+2 (sends MEC,SOLAR1,ON and MEC,SOLAR2,ON)"),
+        dict(name="SOLAR_OFF", targets="P", arg=None, desc="Stow solar panels 1+2 (MEC,SOLAR1/2,OFF)"),
+        dict(name="BOOM_ON",   targets="P", arg=None, destructive=True,
+             desc="Deploy boom"),
+        dict(name="BOOM_OFF",  targets="P", arg=None, desc="Stow boom"),
+        dict(name="CAM_SET",   targets="P", arg="angle",
+             desc="Rotate camera clockwise 10° per press — sends MEC,ROT,<degrees>; "
+                  "type CAM_SET,5 for another angle"),
+    ]),
+    ("Simulation", [
+        dict(name="SIM",          targets="CP", arg=None, required=True,
+             desc="[Required] Start here — then SIM ENABLE (simulation) or FLIGHT ENABLE (flight)"),
+        dict(name="SIM ENABLE",   targets="CP", arg=None,
+             desc="Step 1 of 2 — enable SIM mode (asks for the profile file if none is loaded)"),
+        dict(name="SIM ACTIVATE", targets="CP", arg=None, destructive=True,
+             desc="Step 2 of 2 — MODE -> S and start streaming SIMP (telemetry display starts)"),
+        dict(name="SIM DISABLE",  targets="CP", arg=None,
+             desc="Leave SIM mode, back to FLIGHT (MODE -> F)"),
+        dict(name="SIMP",         targets="CP", arg=None, required=False,
+             desc="Start sending simulated values from the CSV file"),
+    ]),
+]
+
+# Short sidebar tab names for the command groups (full names still used in the COMMANDS tab)
+CMD_TAB_LABEL = {"Setup": "Setup", "Flight": "Flight",
+                 "Mechanisms": "Mech", "Simulation": "Sim"}
+# Groups with a fixed sidebar column count (others adapt to label width)
+CMD_FIXED_COLS = {"Mechanisms": 2}             # 10 buttons -> 2 cols x 5 rows
+
+# ── Simulation command group ──────────────────────────────────────────────────
+# Used only to "allow running through the virtual payload as a loopback without a
+# serial link" — not a program mode switch. The real arm status is still decided
+# from the telemetry the payload returns (GS16 / F6) in _update_sim_state_from_telemetry.
+# Flight-group commands have no such shortcut — a real link is always required.
+# Names are taken straight from COMMAND_GROUPS so the two lists cannot drift apart
+SIM_GROUP_COMMANDS = frozenset(
+    c["name"] for g, cmds in COMMAND_GROUPS if g == "Simulation" for c in cmds)
+
+
+def is_sim_group_command(name):
+    """True if this command name is in the Simulation group of COMMAND_GROUPS."""
+    n = " ".join(str(name or "").upper().split())
+    return n in SIM_GROUP_COMMANDS
+
+
+CMD_TIMEOUT_S = 3.0
+STALE_LINK_S = 3.0          # no packet for >3 s = stale/red (12 periods at 4 Hz, 3 at the 1 Hz post-release container rate)
+
+# ── Telemetry transmit rates ──────────────────────────────────────────────────
+PQ_RATE_HZ = 4                  # PocketQube: 4 Hz for the whole mission
+CONT_RATE_HZ_PRE = 4            # container: 4 Hz until shortly after PQ release
+CONT_RATE_HZ_POST = 1           # container: 1 Hz from then on
+CONT_RATE_SWITCH_DELAY_S = 5.0  # delay after PQ release (container PQ_RELEASE) before 1 Hz
+RATE_WINDOW_S = 3.0             # rolling window for the measured Hz readout (COMMANDS tab)
+SEEN_CACHE_MAX = 4000       # bounded dedupe set
+CHART_POINTS = 240          # 60 s at 4 Hz
+NONE_TEXT = "—"
+SIM_SOURCES = ("FILE", "LINK")
+SIM_SOURCE_LABEL = {
+    "FILE": "FILE ONLY — upload a file (simulated locally, no hardware)",
+    "LINK": "LINK — send SIMP to the real hardware; the FSW computes and sends back",
+}
+PQ_REARM_GAP_S = 2.5        # LINK: PQ powers up after release and needs SIM ENABLE/ACTIVATE again
+PQ_REARM_MAX = 4
+VIRTUAL_TAG = "VIRTUAL"     # packets from VirtualPayload — never mix with real telemetry
+
+# ── ALTITUDE tab: ground-station apogee detection ─────────────────────────────
+#   Same thresholds as the FSW (see VirtualPayload) — climb past ASCENT, then fall DROP below the peak
+APOGEE_ASCENT_M = 15.0      # above this = ascent has started
+APOGEE_DROP_M = 8.0         # this far below the peak = apogee passed (noise guard)
+APOGEE_RELEASE_FRAC = 0.90  # PocketQube release point = 90% of apogee
+APOGEE_COLOR = "#c62828"
+RELEASE_LINE_COLOR = "#2e7d32"
+
+# ── SIMULATION mode (GS7 / GS8 / GS16 / F5 / F6) ──────────────────────────────
+#   IDLE --SIM ENABLE ack--> ENABLED --SIM ACTIVATE ack--> ACTIVE --SIM DISABLE--> IDLE
+SIM_STATES = ("IDLE", "ENABLED", "ACTIVE")
+SIM_STATE_RANK = {s: i for i, s in enumerate(SIM_STATES)}
+SIM_STATE_TEXT = {
+    "IDLE":    "MODE: FLIGHT (real flight)",
+    "ENABLED": "MODE: SIM ENABLED (awaiting confirmation)",
+    "ACTIVE":  "MODE: SIMULATION (simulated data)",
+}
+SIMP_PERIOD_S = 1.0         # GS8: one value per second
+SIMP_RATE_WINDOW = 30       # number of samples averaged for the achieved rate
+
+# Accepted pressure unit — must be Pa only (CTR18 / PQ24)
+PA_RANGE = (30000.0, 115000.0)
+KPA_RANGE = (30.0, 115.0)
+HPA_RANGE = (300.0, 1150.0)
+
+SEA_LEVEL_PA = 101325.0
+
+# ── Map cache defaults (narrowed from zoom 1–19, which took ~4,500 tiles / 90–150 MB) ─
+MAP_CACHE_ZOOM_MIN = 13
+MAP_CACHE_ZOOM_MAX = 18
+MAP_CACHE_RADIUS_DEG = 0.02
+MAP_TILE_BYTES_EST = 30 * 1024      # estimated satellite tile size (JPEG)
+
+# ── Display rules kept from the Tk GUI (GS12) ────────────────────────────────
+FONT_MIN = 14               # GS12: text at least 14 pt
+PLOT_TITLE_SIZE = 12
+PLOT_TITLE_MIN = 8          # titles shrink toward this only when a column is narrow
+PLOT_LABEL_SIZE = 11
+# tick labels smaller than 14 so multi-plot cards stay readable — tune on this one line
+PLOT_TICK_SIZE = 10
+PLOT_LINEWIDTH = 2.6
+PLOT_XLABEL = "mission time (s)"     # shared x axis of every telemetry plot
+VEHICLE_COLOR = {"C": "#0b5ed7", "P": "#b26a00"}    # Container blue, PQ orange
+AXIS_COLORS = ("#00838f", "#6a1b9a", "#c62828")     # X / Y / Z series
+PLOT_AXIS_WIDTH = 1.8
+
+# sidebar wide enough for two columns of command buttons at 14 pt without clipping
+# (longest label is "FLIGHT ACTIVATE", button 162 px wide -> needs ~2x166 + margins)
+SIDEBAR_WIDTH = 366
+PKT_TABLE_PT = 12           # live packet table font (>= 12 pt, fits 43 fields in a strip)
+# value column width (chars) where a value can be longer than its field name
+PKT_VALUE_CHARS = {"MISSION_TIME": 8, "CMD_ECHO": 15, "STATE": 10,
+                   "SCIENCE_EXP": 12,
+                   "GNSS_LATITUDE": 10, "GNSS_LONGITUDE": 11, "GNSS_TIME": 8}
+EVENT_LOG_MIN_LINES = 6     # sidebar CMD ECHO (event log) minimum height, in text lines
+# Minimum width of the telemetry column in the CONTAINER / POCKETQUBE tabs
+# — stops the plots (which ask for a lot of width) squeezing the values until digits clip
+TELEM_COL_MIN_W = 330
+LOG_MAX_LINES = 500         # event log, center console and TELEMETRY LOG boxes keep the newest lines
+UPLINK_REMIND_DELAY_S = 5.0  # BOOM_ON / CAM_SET reminder delay after solar / boom deploy
+# event-log tag -> theme colour key. Legacy _log tags: sys/tel -> info, cmd -> sent
+EVENT_TAG_COLORS = {"sent": "accent", "ack": "ok", "state": "title",
+                    "alert": "err", "warn": "warn", "err": "err", "info": "text"}
+EVENT_TAG_ALIAS = {"sys": "info", "tel": "info", "cmd": "sent"}
+VEHICLE_TITLE = {"C": "Container", "P": "PocketQube"}
+
+THEMES = {
+    # GS12: default = dark text on a light background
+    "light": dict(
+        bg="#f2f4f7", card_bg="#ffffff", card_border="#c8d0da",
+        sidebar="#e6ebf2",
+        text="#14202e", label="#3c4a5a", title="#0b2545",
+        muted_bg="#e8edf3", accent="#0b5ed7", accent_fg="#ffffff",
+        ok="#1b7f3b", warn="#b26a00", err="#b3261e", idle="#8a97a5",
+        chart_bg="#ffffff", console_bg="#ffffff", console_fg="#14202e",
+        grid="#c9d3de",
+    ),
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Parsing helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+NAN_TOKENS = {"NAN", "NA", "N/A", "N/C", "---", "", "NONE", "NULL"}
+
+
+def calc_checksum(s):
+    x = 0
+    for c in s:
+        x ^= ord(c)
+    return x
+
+
+def verify_line(raw):
+    """Return (payload, status) — status = 'OK' | 'FAIL' | 'NONE' (no checksum)."""
+    raw = raw.strip()
+    if "*" not in raw:
+        return raw, "NONE"
+    idx = raw.rfind("*")
+    data, chk_s = raw[:idx], raw[idx + 1:]
+    try:
+        return data, ("OK" if int(chk_s, 16) == calc_checksum(data) else "FAIL")
+    except Exception:
+        return data, "FAIL"
+
+
+def to_float(v):
+    """NaN / sensor failure -> None (must not break the other fields)."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s.upper() in NAN_TOKENS:
+        return None
+    try:
+        f = float(s)
+    except Exception:
+        return None
+    return None if math.isnan(f) else f
+
+
+def to_int(v):
+    f = to_float(v)
+    return None if f is None else int(f)
+
+
+def parse_hex(v):
+    if v is None:
+        return None
+    s = str(v).strip().upper().replace("0X", "")
+    if s in NAN_TOKENS or not s:
+        return None
+    try:
+        return int(s, 16)
+    except Exception:
+        return None
+
+
+def show(v, decimals=None):
+    if v is None:
+        return NONE_TEXT
+    if isinstance(v, float):
+        if math.isnan(v):
+            return NONE_TEXT
+        return f"{v:.{decimals if decimals is not None else 2}f}"
+    s = str(v).strip()
+    if s.upper() in NAN_TOKENS:
+        return NONE_TEXT
+    if decimals is not None:
+        f = to_float(s)
+        if f is not None:
+            return f"{f:.{decimals}f}"
+    return s
+
+
+def field_text(d, key):
+    """Display value with units, per the resolution in the spec."""
+    raw = d.get(key)
+    dec = DECIMALS.get(key)
+    txt = show(raw, dec)
+    unit = UNITS.get(key)
+    if txt != NONE_TEXT and unit:
+        return f"{txt} {unit}"
+    return txt
+
+
+def parse_gnss_time(raw) -> str:
+    """
+    Convert GNSS_TIME from NMEA GPS format (HHMMSS.SS or HHMMSS)
+    to a readable HH:MM:SS UTC.
+    If it cannot be parsed → return the original raw string.
+    Examples: '143025.00' → '14:30:25 UTC'
+              '093000'   → '09:30:00 UTC'
+    """
+    if raw is None:
+        return NONE_TEXT
+    s = str(raw).strip()
+    if not s or s.upper() in NAN_TOKENS:
+        return NONE_TEXT
+    try:
+        int_part = s.split(".")[0]
+        if len(int_part) < 6:
+            return s
+        hh = int(int_part[0:2])
+        mm = int(int_part[2:4])
+        ss = int(int_part[4:6])
+        if 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
+            return f"{hh:02d}:{mm:02d}:{ss:02d} UTC"
+        return s
+    except (ValueError, IndexError):
+        return s
+
+
+def parse_packet(raw):
+    """
+    Split packets by ID suffix: 1059C -> container, 1059P -> PocketQube.
+    Return a dict, or None if not ours / too short (X4/X5).
+    """
+    data, chk = verify_line(raw)
+    parts = [p.strip() for p in data.split(",")]
+    if not parts or not parts[0]:
+        return None
+    pid = parts[0].strip().upper()
+    if pid == CONTAINER_ID:
+        vehicle, fields = "C", CONTAINER_FIELDS
+    elif pid == PQ_ID:
+        vehicle, fields = "P", PQ_FIELDS
+    else:
+        return None
+    if len(parts) < len(fields):
+        return None
+
+    d = {fields[i]: parts[i] for i in range(len(fields))}
+    d["_VEHICLE"] = vehicle
+    d["_EXTRA"] = parts[len(fields):] if vehicle == "P" else []
+    d["_CHECKSUM"] = chk
+    d["_RAW"] = raw.strip()
+    d["_RECV_TIME"] = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    d["_MECH"] = parse_hex(d.get("MECH_STATE"))
+    d["_PKT"] = to_int(d.get("PACKET_COUNT"))
+    return d
+
+
+def extra_column_names(n):
+    """
+    Name the PQ trailing-field columns for the CSV header.
+    The first n (= IMAGE_STAB_FIELD_COUNT) are IMAGE_STABILIZATION, the rest are
+    SCIENCE_EXP, in PQ_TRAILING order.
+    """
+    img_name, sci_name = PQ_TRAILING
+    names = []
+    for i in range(n):
+        if i < IMAGE_STAB_FIELD_COUNT:
+            names.append(f"{img_name}_{i + 1}")
+        else:
+            names.append(f"{sci_name}_{i - IMAGE_STAB_FIELD_COUNT + 1}")
+    return names
+
+
+# Internal name (button / virtual payload) -> actual on-air body per SPEC §9.  {arg} = typed value
+WIRE_ALIASES = {
+    "SOLAR_ON":  ["MEC,SOLAR1,ON", "MEC,SOLAR2,ON"],
+    "SOLAR_OFF": ["MEC,SOLAR1,OFF", "MEC,SOLAR2,OFF"],
+    "BOOM_ON":   ["MEC,BOOM,ON"],
+    "BOOM_OFF":  ["MEC,BOOM,OFF"],
+    "CAM_SET":   ["MEC,ROT,{arg}"],
+}
+ECHO_MAX = 15                   # SPEC §5.10: CMD_ECHO <= 15 characters
+CAM_TURN_ECHOES = ("CAMSET", "MECROT")
+
+
+def wire_commands(name, arg=None, vehicle=None):
+    """
+    The single place in the program that turns "command name + argument" into the radio string
+    (returns a list because some commands need two lines, e.g. SOLAR_ON = SOLAR1 + SOLAR2).
+    vehicle 'C'/'P' -> team field = 1059C / 1059P (X5); None -> 1059.
+        wire_commands("SIMP", 101325, "C") -> ['CMD,1059C,SIMP,101325']
+        wire_commands("BOOM_ON", None, "P") -> ['CMD,1059P,MEC,BOOM,ON']
+    """
+    key = "_".join(str(name).upper().split())
+    arg = "" if arg is None else str(arg).strip()
+    if key.startswith("MEC") and arg:
+        arg = ",".join(arg.replace(",", " ").split())      # 'BOOM ON' -> 'BOOM,ON'
+    if key in WIRE_ALIASES:
+        bodies = [b.replace("{arg}", arg) for b in WIRE_ALIASES[key]]
+    else:
+        body = ",".join(str(name).split())
+        if arg:
+            body += "," + arg
+        bodies = [body]
+    team = {"C": CONTAINER_ID, "P": PQ_ID}.get(vehicle, str(TEAM_ID))
+    return [COMMAND_WIRE_TEMPLATE.replace("<TEAM>", team).replace("<BODY>", b)
+            for b in bodies]
+
+
+def wire_command(name, arg=None, vehicle=None):
+    """First line of wire_commands() — for single-line commands."""
+    return wire_commands(name, arg, vehicle)[0]
+
+
+def expected_echo(wire):
+    """CMD_ECHO the FSW should return: body only, uppercase, no commas, <= ECHO_MAX."""
+    body = wire.split(",", 2)[2] if wire.count(",") >= 2 else wire
+    return echo_token(body)[:ECHO_MAX]
+
+
+def echo_token(name):
+    # ':' dropped too: ST,12:30:45 is echoed ST123045 (FSW COMMANDS.md)
+    return (str(name).upper().replace(" ", "").replace(",", "").replace("_", "")
+            .replace(":", ""))
+
+
+def pressure_pa_to_alt(pa, sea_level_pa=SEA_LEVEL_PA):
+    """Standard barometric formula — Pa -> metres (relative to sea_level_pa)."""
+    if pa is None or pa <= 0:
+        return None
+    try:
+        return 44330.0 * (1.0 - (pa / sea_level_pa) ** 0.1903)
+    except Exception:
+        return None
+
+
+def alt_to_pressure_pa(alt_m, sea_level_pa=SEA_LEVEL_PA):
+    return sea_level_pa * (1.0 - 2.25577e-5 * alt_m) ** 5.25588
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GS8 — Pressure profile reader
+#  Must read the "judges' file" without editing it (The pressure profile data file
+#  will be provided by the competition judges).  The format is not specified in the
+#  guide, so every format seen so far is supported and auto-detected.
+# ══════════════════════════════════════════════════════════════════════════════
+
+PROFILE_FORMATS = {
+    "SIMP_COMMANDS": "Command lines CMD,<TEAMID>,SIMP,<Pa>",
+    "CSV_PRESSURE_COLUMN": "CSV with a PRESSURE column header",
+    "BARE_NUMBERS": "Single column of pressure numbers",
+}
+
+
+def _detect_unit(values):
+    """
+    Guess the unit from the median. Never converts by itself — returns the unit name so the UI asks the user first.
+    A silent wrong unit conversion invalidates the whole demonstration run.
+    """
+    if not values:
+        return "UNKNOWN", 1.0
+    med = statistics.median(values)
+    if PA_RANGE[0] <= med <= PA_RANGE[1]:
+        return "Pa", 1.0
+    if KPA_RANGE[0] <= med <= KPA_RANGE[1]:
+        return "kPa", 1000.0
+    if HPA_RANGE[0] <= med <= HPA_RANGE[1]:
+        return "hPa/mbar", 100.0
+    return "UNKNOWN", 1.0
+
+
+def load_pressure_profile(path):
+    """
+    Returns a dict:
+        rows      : [(raw_text, value_float), ...]  in file order
+        fmt       : key in PROFILE_FORMATS
+        unit      : 'Pa' | 'kPa' | 'hPa/mbar' | 'UNKNOWN'
+        factor    : multiplier that *would* be used if the user confirms conversion to Pa
+        n         : number of rows
+        pmin/pmax : min/max pressure (in the file's unit)
+    Raises ValueError if there are no usable rows.
+    """
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+        raw_lines = f.read().splitlines()
+
+    lines = []
+    for ln in raw_lines:
+        s = ln.strip()
+        if not s or s.startswith("#"):        # skip blank and comment lines
+            continue
+        lines.append(s)
+    if not lines:
+        raise ValueError("File is empty or has only comment lines")
+
+    rows = []
+    fmt = None
+
+    # ── Format 1: command lines CMD,<TEAMID>,SIMP,<Pa> ────────────────────────
+    if any(",SIMP," in ln.upper() for ln in lines):
+        fmt = "SIMP_COMMANDS"
+        for n, ln in enumerate(lines, start=1):
+            up = ln.upper()
+            if ",SIMP," not in up:
+                continue
+            idx = up.rindex(",SIMP,")
+            tail = ln[idx + len(",SIMP,"):].split(",")[0].strip()
+            v = to_float(tail)
+            if v is None:
+                raise ValueError(f"Invalid pressure value at line {n}: {ln[:60]}")
+            # <TEAMID> may be a placeholder or a real team number — we don't care
+            # because the command is always rebuilt with our own TEAM_ID
+            rows.append((tail, v))
+    else:
+        parsed = [[c.strip() for c in r] for r in csv.reader(lines)]
+        header = [c.upper().replace(" ", "").replace("_", "") for c in parsed[0]]
+        col_idx, start = None, 0
+        for i, c in enumerate(header):
+            if "PRESSURE" in c or c in {"KPA", "PA", "HPA", "MBAR"}:
+                col_idx, start, fmt = i, 1, "CSV_PRESSURE_COLUMN"
+                break
+        if col_idx is None:
+            # ── Format 3: bare numbers, single column ──────────────────────────
+            if to_float(parsed[0][0]) is None:
+                raise ValueError("Unreadable — expected CMD,...,SIMP,<Pa> lines "
+                                 "or a CSV with a PRESSURE column "
+                                 "or a single column of pressure numbers")
+            col_idx, start, fmt = 0, 0, "BARE_NUMBERS"
+        for n, row in enumerate(parsed[start:], start=start + 1):
+            if col_idx >= len(row) or not row[col_idx]:
+                continue
+            v = to_float(row[col_idx])
+            if v is None:
+                raise ValueError(f"Invalid pressure value at line {n}: "
+                                 f"{row[col_idx]}")
+            rows.append((row[col_idx], v))
+
+    if not rows:
+        raise ValueError("No usable pressure rows found in this file")
+
+    vals = [v for _, v in rows]
+    unit, factor = _detect_unit(vals)
+    return dict(rows=rows, fmt=fmt, unit=unit, factor=factor, n=len(rows),
+                pmin=min(vals), pmax=max(vals), path=path)
+
+
+def profile_summary(info):
+    """Summary text used both in the confirmation dialog and the event log."""
+    a_hi = pressure_pa_to_alt(info["pmin"] * info["factor"])
+    a_lo = pressure_pa_to_alt(info["pmax"] * info["factor"])
+    dur = info["n"] / SIMP_PERIOD_S if SIMP_PERIOD_S else 0
+    return (f"Format: {PROFILE_FORMATS.get(info['fmt'], info['fmt'])}\n"
+            f"Rows: {info['n']}   ({dur:.0f} s at 1 Hz)\n"
+            f"Pressure: {info['pmin']:.0f} .. {info['pmax']:.0f} "
+            f"(detected unit: {info['unit']})\n"
+            f"Implied altitude: {show(a_lo, 1)} .. {show(a_hi, 1)} m")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Link layer
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LinkReader(threading.Thread):
+    """One thread per radio — reconnects by itself when the port drops (as in b.py)."""
+
+    def __init__(self, key, cfg, rx_q, tx_q, stop_ev):
+        super().__init__(daemon=True, name=f"reader-{key}")
+        self.key = key
+        self.port = cfg["port"]
+        self.baud = int(cfg["baud"])
+        self.rx_q = rx_q
+        self.tx_q = tx_q
+        self.stop_ev = stop_ev
+
+    def _status(self, msg, connected=None):
+        self.rx_q.put(("STATUS", self.key, msg, connected))
+
+    def run(self):
+        while not self.stop_ev.is_set():
+            ser = None
+            try:
+                ser = serial.Serial(self.port, self.baud, timeout=1)
+                self._status(f"connected {self.port} @ {self.baud}", True)
+                while not self.stop_ev.is_set():
+                    while not self.tx_q.empty():
+                        try:
+                            cmd = self.tx_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        ser.write((cmd + "\n").encode())
+                        self.rx_q.put(("TX", self.key, cmd, None))
+                    line = ser.readline().decode("utf-8", errors="replace").strip()
+                    if line:
+                        self.rx_q.put(("DATA", self.key, line, None))
+            except Exception as e:
+                self._status(f"port error: {e}", False)
+                if self.stop_ev.wait(2.0):
+                    break
+            finally:
+                try:
+                    if ser is not None:
+                        ser.close()
+                except Exception:
+                    pass
+        self._status("stopped", False)
+
+
+class LinkManager:
+    """Holds the 4 readers + one tx queue per link. Dedupe happens in the UI thread."""
+
+    def __init__(self, rx_q):
+        self.rx_q = rx_q
+        self.cfg = {k: dict(v) for k, v in DEFAULT_LINKS.items()}
+        self.readers = {}
+        self.stop_evs = {}
+        self.tx_qs = {k: queue.Queue() for k in LINK_KEYS}
+
+    # ── config persistence ────────────────────────────────────────────────
+    def load_config(self, path=CONFIG_FILE):
+        if not os.path.exists(path):
+            return False, f"{os.path.basename(path)} not found — using defaults"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            for k in LINK_KEYS:
+                if k in saved and isinstance(saved[k], dict):
+                    self.cfg[k].update(
+                        {kk: saved[k][kk] for kk in
+                         ("port", "baud", "channel", "netid", "peer_mac")
+                         if kk in saved[k]})
+            return True, f"Loaded {os.path.basename(path)}"
+        except Exception as e:
+            return False, f"Cannot read config: {e}"
+
+    def save_config(self, path=CONFIG_FILE):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, indent=2, ensure_ascii=False)
+            return True, f"Saved {os.path.basename(path)}"
+        except Exception as e:
+            return False, f"Cannot save config: {e}"
+
+    # ── validation (Mission Guide X2/X3/X6) ───────────────────────────────
+    def validate(self):
+        warns = []
+        ports = {}
+        for k in LINK_KEYS:
+            c = self.cfg[k]
+            mac = (c.get("peer_mac") or "").strip().upper()
+            if c["radio"] == "ESPNOW":
+                if mac.replace("-", ":") == BROADCAST_MAC:
+                    warns.append(f"[X6] {k}: broadcast MAC not allowed "
+                                 f"{BROADCAST_MAC}")
+                elif not mac:
+                    warns.append(f"[X3] {k}: peer MAC not set — must be the MAC "
+                                 f"of the ground station radio")
+                ch = str(c.get("channel", "")).strip()
+                if ch and ch not in ESPNOW_CLEAN_CHANNELS:
+                    warns.append(f"[X2] {k}: ESPNOW channel {ch} is not 1/6/11 "
+                                 f"(the non-overlapping channels)")
+            else:
+                if not str(c.get("netid", "")).strip():
+                    warns.append(f"{k}: XBee NETID/PANID empty — must be the team number "
+                                 f"{TEAM_ID}")
+            p = (c.get("port") or "").strip()
+            if p:
+                ports.setdefault(p, []).append(k)
+
+        for radio in RADIOS:
+            ck = self.cfg[link_key("C", radio)].get("channel", "")
+            pk = self.cfg[link_key("P", radio)].get("channel", "")
+            if str(ck).strip() and str(ck).strip() == str(pk).strip():
+                warns.append(f"[X2] {RADIO_LABEL[radio]}: container and "
+                             f"PocketQube use the same channel ({ck}) "
+                             f"— they must differ")
+
+        for p, ks in ports.items():
+            if len(ks) > 1:
+                warns.append(f"Port {p} is used more than once in {', '.join(ks)}")
+        return warns
+
+    # ── connect / disconnect ──────────────────────────────────────────────
+    def is_connected(self, key):
+        r = self.readers.get(key)
+        return r is not None and r.is_alive()
+
+    def any_connected(self):
+        return any(self.is_connected(k) for k in LINK_KEYS)
+
+    def connect(self, key):
+        if self.is_connected(key):
+            return False, "Already connected"
+        cfg = self.cfg[key]
+        if not (cfg.get("port") or "").strip():
+            return False, "No serial port selected"
+        ev = threading.Event()
+        self.stop_evs[key] = ev
+        r = LinkReader(key, cfg, self.rx_q, self.tx_qs[key], ev)
+        self.readers[key] = r
+        r.start()
+        return True, f"Opened {key} on {cfg['port']}"
+
+    def disconnect(self, key):
+        ev = self.stop_evs.get(key)
+        if ev:
+            ev.set()
+        self.readers.pop(key, None)
+        return True, f"Closed {key}"
+
+    def send(self, key, cmd):
+        """Send on the selected link only — no fan-out to both radios."""
+        self.tx_qs[key].put(cmd)
+
+    def shutdown(self):
+        for ev in self.stop_evs.values():
+            ev.set()
+        for r in list(self.readers.values()):
+            if r.is_alive():
+                r.join(timeout=1.5)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  VirtualPayload — "loopback virtual CanSat"
+# ══════════════════════════════════════════════════════════════════════════════
+#  This simulator behaves exactly like the real flight software where the rules apply:
+#
+#   F6 / GS16  Only SIM ENABLE followed by SIM ACTIVATE enters
+#              SIMULATION mode — any SIMP received before that is "discarded"
+#   F5         In SIM mode, use the pressure sent by the ground station
+#              instead of the real sensor, and compute altitude from it
+#   line 1249  The resulting altitude drives the state machine (ascent detection, apogee,
+#              and the PocketQube release point at 90% apogee)
+#   line 1215  Other values (battery, temperature, IMU, GNSS) are normal sensor values
+#   MODE       'S' during SIM mode, 'F' otherwise
+#   RATES      PocketQube PQ_RATE_HZ (4 Hz); container CONT_RATE_HZ_PRE (4 Hz) until
+#              CONT_RATE_SWITCH_DELAY_S after PQ release, then CONT_RATE_HZ_POST (1 Hz)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VirtualPayload(threading.Thread):
+    DT = 0.25                    # base tick = 4 Hz (container drops to 1 Hz after release)
+
+    # "Real sensor" profile used when *not* in SIM mode
+    APOGEE_M = 700.0
+    T_LAUNCH = 6.0
+    T_APOGEE = 26.0
+    T_LANDED = 105.0
+
+    # State machine thresholds (shared by flight and simulation)
+    ASCENT_M = 15.0              # above this = ascending
+    APOGEE_DROP_M = 8.0          # this far below the peak = apogee passed (noise guard)
+    LANDED_M = 8.0               # below this after having climbed = landed
+    RELEASE_FRAC = 0.90          # release the PQ at 90% of apogee
+    SOLAR_DELAY_S = 5.0          # deploy solar 5 s after release
+    BOOM_DELAY_S = 10.0          # deploy boom 10 s after release
+
+    def __init__(self, rx_q, stop_ev, speed=1.0):
+        super().__init__(daemon=True, name="virtual-payload")
+        self.rx_q = rx_q
+        self.stop_ev = stop_ev
+        self.speed = max(0.1, speed)
+        self.lock = threading.Lock()
+        self.flip_by_vehicle = {"C": 0, "P": 0}
+        self._reset_mission_fields()
+
+    def _reset_mission_fields(self):
+        """Set all "per-mission" state — called from __init__ and reset."""
+        self.t = 0.0
+        self.c_pkt = 0
+        self.p_pkt = 0
+        self.c_cmd = 0
+        self.p_cmd = 0
+        self.c_echo = "NONE"
+        self.p_echo = "NONE"
+
+        # ── payload-side SIM state (independent of the ground-station side) ───────
+        self.sim_state = {"C": "IDLE", "P": "IDLE"}
+        self.simp_pa = {"C": None, "P": None}     # latest value sent by the uplink
+        self.simp_rx = {"C": 0, "P": 0}           # SIMP values actually used
+        self.simp_ignored = {"C": 0, "P": 0}      # SIMP dropped because not armed yet
+        self.ground_pa = {"C": SEA_LEVEL_PA, "P": SEA_LEVEL_PA}
+        self.need_zero = {"C": False, "P": False}
+
+        # ── state machine driven by the computed altitude ───────────────────
+        self.max_alt = 0.0
+        self.apogee_alt = None
+        self.c_state = "LAUNCH_PAD"
+        self.t_release = None
+        self.cam_turned = False
+        self.c_mech = 0
+        self.p_mech = 0
+        self._c_next_emit_t = None       # sim time the next container packet is due
+
+        # ── boom uplink reminder / fail-safe (no clock-based auto-deploy anymore) ─
+        self.boom_cmd_sent = False       # BOOM_ON pressed / auto-fired yet?
+        self._boom_window_notified = False   # uplink-window reminder already sent?
+        self._cam_reminder_sent = False      # CAM_SET reminder already sent? (once)
+
+    def reset_mission(self):
+        """SIM DISABLE — reset the mission to its initial state for a clean new demo."""
+        with self.lock:
+            self._reset_mission_fields()
+        self._status("virtual CanSat: mission reset to its initial state")
+
+    # ── uplink into the payload ───────────────────────────────────────────
+    def command(self, vehicle, name, arg=None, echo=None):
+        """
+        Called from the UI thread when the ground station sends a command.
+        The payload responds like the real FSW: counts COMMAND_COUNT, sets CMD_ECHO,
+        and *enforces the two-step arming gate* before accepting SIMP.
+        """
+        tok = echo_token(name)
+        with self.lock:
+            if vehicle == "C":
+                self.c_cmd += 1
+                self.c_echo = echo or tok
+            else:
+                self.p_cmd += 1
+                self.p_echo = echo or tok
+
+            if tok == "SIMENABLE":
+                self.sim_state[vehicle] = "ENABLED"
+                self._status(f"virtual {VEHICLE_NAME[vehicle]}: SIM ENABLED "
+                             f"(step 1/2)")
+            elif tok == "SIMACTIVATE":
+                if self.sim_state[vehicle] == "ENABLED":
+                    self.sim_state[vehicle] = "ACTIVE"
+                    self.need_zero[vehicle] = True
+                    self.simp_pa[vehicle] = None
+                    self._status(f"virtual {VEHICLE_NAME[vehicle]}: SIMULATION "
+                                 f"MODE ACTIVE — MODE = S (step 2/2)")
+                else:
+                    self._status(f"virtual {VEHICLE_NAME[vehicle]}: rejected "
+                                 f"SIM ACTIVATE — SIM ENABLE not received yet (F6)")
+            elif tok in ("SIMDISABLE", "SIMDEACTIVATE", "SIMPDEACTIVATE"):
+                self.sim_state[vehicle] = "IDLE"
+                self.simp_pa[vehicle] = None
+                self._status(f"virtual {VEHICLE_NAME[vehicle]}: left SIM mode "
+                             f"— MODE = F")
+            elif tok == "SIMP":
+                v = to_float(arg)
+                if self.sim_state[vehicle] != "ACTIVE":
+                    self.simp_ignored[vehicle] += 1
+                    if self.simp_ignored[vehicle] in (1, 5, 20):
+                        self._status(
+                            f"virtual {VEHICLE_NAME[vehicle]}: dropped SIMP "
+                            f"({self.simp_ignored[vehicle]} values) — not in "
+                            f"SIMULATION mode (F6)")
+                elif v is not None and v > 0:
+                    if self.need_zero[vehicle]:
+                        # Implicit CAL: the first pressure received = field ground level
+                        self.ground_pa[vehicle] = v
+                        self.need_zero[vehicle] = False
+                    self.simp_pa[vehicle] = v
+                    self.simp_rx[vehicle] += 1
+            elif tok == "CAL":
+                cur = self._pressure(vehicle, self.t)
+                self.ground_pa[vehicle] = cur
+                self._status(f"virtual {VEHICLE_NAME[vehicle]}: CAL — ground "
+                             f"pressure set to {cur:.0f} Pa")
+            elif tok == "MECRELEASEON" and vehicle == "C":
+                if self.t_release is None:
+                    self.c_state = "PQ_RELEASE"
+                    self.t_release = self.t
+                    self.c_mech |= (1 << C_BIT_MECH_ACTIVE)
+                    self._status("virtual CONTAINER: MEC RELEASE ON — "
+                                 "PocketQube released manually")
+            elif tok == "CAMSET":
+                self.cam_turned = True
+                self._status("virtual POCKETQUBE: CAM_SET — camera rotated "
+                             "(entering CAMERA_TURN)")
+            elif tok == "BOOMON":
+                self.boom_cmd_sent = True
+                was_deployed = bool((self.p_mech >> PQ_BIT_BOOM) & 1)
+                self.p_mech |= (1 << PQ_BIT_BOOM)
+                self._status("virtual POCKETQUBE: BOOM_ON — boom deployed "
+                             "(confirmed by magnetometer)")
+                if not was_deployed and not self._cam_reminder_sent:
+                    self._cam_reminder_sent = True
+                    self.rx_q.put(("MECH_WINDOW", None,
+                                   {"vehicle": "P", "mech": "CAM",
+                                    "auto_after_s": None}, None))
+            elif tok == "BOOMOFF":
+                self.boom_cmd_sent = False
+                self.p_mech &= ~(1 << PQ_BIT_BOOM)
+                self._status("virtual POCKETQUBE: BOOM_OFF — boom status cleared")
+
+    def _status(self, msg):
+        self.rx_q.put(("STATUS", None, msg, None))
+
+    def sim_mode_flag(self, vehicle):
+        return "S" if self.sim_state[vehicle] == "ACTIVE" else "F"
+
+    # ── pressure source: SIMP once armed, otherwise the "real sensor" ─────────
+    def _free_flight_alt(self, t):
+        # No random values / auto-launch, as the user specified
+        return 0.0
+
+    def _pressure(self, vehicle, t):
+        """F5 — in SIM mode use the uplinked value instead of the real pressure sensor.
+
+        The _free_flight_alt() curve stands in for the "real sensor" when testing
+        flight mode only, so it is used only while IDLE. During the arm sequence
+        (ENABLED), or ACTIVE with no SIMP value yet, it must stay at
+        ground pressure (AGL = 0), otherwise the plot would climb with no real data.
+        """
+        st = self.sim_state[vehicle]
+        if st == "ACTIVE" and self.simp_pa[vehicle]:
+            return self.simp_pa[vehicle]
+        if st == "IDLE":
+            return alt_to_pressure_pa(self._free_flight_alt(t))
+        return self.ground_pa[vehicle]
+
+    def _altitude(self, vehicle, pressure):
+        """AGL altitude — from the current pressure relative to the ground pressure set by CAL."""
+        a = pressure_pa_to_alt(pressure)
+        a0 = pressure_pa_to_alt(self.ground_pa[vehicle])
+        if a is None or a0 is None:
+            return 0.0
+        return a - a0
+
+    # ── state machine driven by altitude (not by the clock) ──────────────
+    def _advance_states(self, alt, t):
+        if alt > self.max_alt:
+            self.max_alt = alt
+
+        if self.c_state == "LAUNCH_PAD":
+            if alt >= self.ASCENT_M:
+                self.c_state = "ASCENT"
+        elif self.c_state == "ASCENT":
+            if self.max_alt >= self.ASCENT_M and alt <= self.max_alt - self.APOGEE_DROP_M:
+                self.apogee_alt = self.max_alt
+                self.c_state = "APOGEE"
+                self._status(f"virtual CONTAINER: apogee = {self.apogee_alt:.1f} m "
+                             f"— release PQ at "
+                             f"{self.RELEASE_FRAC * self.apogee_alt:.1f} m")
+        elif self.c_state == "APOGEE":
+            if self.apogee_alt and alt <= self.RELEASE_FRAC * self.apogee_alt:
+                self.c_state = "PQ_RELEASE"
+                self.t_release = t
+                self.c_mech |= (1 << C_BIT_MECH_ACTIVE)
+                self._status(f"virtual CONTAINER: PocketQube released at "
+                             f"{alt:.1f} m (90% apogee)")
+        elif self.c_state == "PQ_RELEASE":
+            if alt <= self.LANDED_M:
+                self.c_state = "LANDED"
+                self._status("virtual CONTAINER: LANDED")
+
+        if (self.t_release is not None
+                and t > self.t_release + 0.5
+                and not (self.c_mech >> C_BIT_PQ_RELEASED) & 1):
+            self.c_mech |= (1 << C_BIT_PQ_RELEASED)     # micro switch confirms
+
+        # ── PocketQube mechanisms ────────────────────────────────────────
+        if self.t_release is not None:
+            dt_rel = t - self.t_release
+            self.p_mech |= (1 << PQ_BIT_CAM_REC)        # camera records from separation
+            if dt_rel >= self.SOLAR_DELAY_S:
+                self.p_mech |= (1 << PQ_BIT_SOLAR_1) | (1 << PQ_BIT_SOLAR_2)
+            # boom no longer auto-deploys on a timer — like the real FSW it waits for
+            # the BOOM_ON uplink from the ground station (see command() case BOOMON);
+            # here we only announce, once, that the window to press it has arrived
+            if (dt_rel >= self.BOOM_DELAY_S
+                    and not self._boom_window_notified):
+                self._boom_window_notified = True
+                self.rx_q.put(("MECH_WINDOW", None,
+                               {"vehicle": "P", "mech": "BOOM",
+                                "auto_after_s": 2.0}, None))
+
+    # ── emission ──────────────────────────────────────────────────────────
+    def _emit(self, vehicle, line):
+        """Send the same packet out on both radios (parallel, no primary)."""
+        raw = f"{line}*{calc_checksum(line):02X}"
+        order = list(RADIOS)
+        # count per vehicle, otherwise a shared parity makes one vehicle always win the same link
+        n = self.flip_by_vehicle[vehicle] = self.flip_by_vehicle[vehicle] + 1
+        # alternate every packet — the radios are equal, neither wins systematically
+        if n % 2 == 0:
+            order.reverse()
+        for i, radio in enumerate(order):
+            if n % 23 == 0 and i == 1:               # simulate a packet lost on one link
+                continue
+            self.rx_q.put(("DATA", link_key(vehicle, radio), raw, VIRTUAL_TAG))
+
+    def _container_line(self, t, alt, pres):
+        self.c_pkt += 1
+        temp = 28.0 - 0.0065 * alt                   # real sensor (not a sim value)
+        temp_s = "NaN" if 40.0 < t < 41.5 else f"{temp:.1f}"
+        batt_v = 8.2 - 0.002 * t
+        batt_i = 320 + 40 * math.sin(t / 3.0)
+        return (f"{CONTAINER_ID},{t:.3f},{self.c_pkt},{self.c_cmd},"
+                f"{self.sim_mode_flag('C')},"
+                f"{alt:.1f},{pres:.0f},{temp_s},{batt_v:.1f},{batt_i:.0f},"
+                f"{self.c_mech:02X},{self.c_state},{self.c_echo}")
+
+    def _pq_line(self, t, alt, pres, dt_rel):
+        self.p_pkt += 1
+        temp = 27.5 - 0.0065 * alt
+        volt = 3.9 - 0.001 * dt_rel
+        curr = 180 + 25 * math.sin(dt_rel / 2.0)
+        lat = MAP_HOME[0] + dt_rel * 0.000035
+        lon = MAP_HOME[1] + dt_rel * 0.000022
+        sats = 9 if dt_rel > 2 else 5
+        gt = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")
+        rx = 12.0 * math.sin(dt_rel / 1.7)
+        ry = 9.0 * math.cos(dt_rel / 2.1)
+        rz = 24.0 * math.sin(dt_rel / 0.9)
+        ax = 0.35 * math.sin(dt_rel / 1.3)
+        ay = 0.28 * math.cos(dt_rel / 1.1)
+        az = -9.806 + 0.4 * math.sin(dt_rel / 3.0)
+        mx = 210 + 30 * math.sin(dt_rel / 4.0)
+        my = -140 + 25 * math.cos(dt_rel / 4.0)
+        mz = 380 + 20 * math.sin(dt_rel / 6.0)
+        solar_on = bool((self.p_mech >> PQ_BIT_SOLAR_1) & 1)
+        s1 = 4.60 + 0.25 * math.sin(dt_rel / 5.0) if solar_on else 0.0
+        s2 = 4.45 + 0.25 * math.cos(dt_rel / 5.0) if solar_on else 0.0
+        img = f"{0.5 * math.sin(dt_rel):.3f}"
+        sci1 = f"{22.0 + 0.5 * math.sin(dt_rel / 3.0):.2f}"
+        sci2 = f"{55 + int(5 * math.cos(dt_rel / 3.0))}"
+        gnss_alt_s = "NaN" if 30.0 < dt_rel < 31.0 else f"{alt + 1.5:.1f}"
+        return (f"{PQ_ID},{self.sim_mode_flag('P')},{t:.3f},{self.p_pkt},"
+                f"{self.p_cmd},"
+                f"{alt:.1f},{temp:.1f},{pres:.0f},{volt:.1f},{curr:.0f},"
+                f"{gt},{gnss_alt_s},{lat:.6f},{lon:.6f},{sats},"
+                f"{rx:.1f},{ry:.1f},{rz:.1f},{ax:.3f},{ay:.3f},{az:.3f},"
+                f"{mx:.0f},{my:.0f},{mz:.0f},{s1:.2f},{s2:.2f},"
+                f"{self.p_mech:02X},{self.p_echo},{img},{sci1},{sci2}")
+
+    def container_rate_hz(self, t):
+        """Container transmit rate at sim time t: 4 Hz, then 1 Hz from
+        CONT_RATE_SWITCH_DELAY_S after PocketQube release."""
+        if (self.t_release is not None
+                and t >= self.t_release + CONT_RATE_SWITCH_DELAY_S):
+            return CONT_RATE_HZ_POST
+        return CONT_RATE_HZ_PRE
+
+    def _container_due(self, t):
+        """True if a container packet is due at sim time t.
+
+        Schedules on sim time (next due = previous due + period), not by
+        counting ticks, so it is drift-free, independent of self.speed and
+        of the dt passed to step()."""
+        eps = 1e-9
+        nxt = self._c_next_emit_t
+        if nxt is not None and t + eps < nxt:
+            return False
+        period = 1.0 / self.container_rate_hz(t)
+        nxt = t if nxt is None else nxt
+        nxt += period
+        if nxt <= t + eps:                 # far behind (large dt): re-anchor on now
+            nxt = t + period
+        self._c_next_emit_t = nxt
+        return True
+
+    def step(self, dt=None):
+        """
+        Run one tick — split out as a method so it can be tested without the thread
+        (verification scripts call it directly).
+
+        In SIM mode: no telemetry is sent until that vehicle's sim_state is
+        ACTIVE **and** a SIMP value (from the CSV) has arrived.  Keeps fake values
+        from the math.sin formulas off the dashboard plots.
+        """
+        dt = self.DT if dt is None else dt
+        with self.lock:
+            # ── has SIMP data from the CSV arrived yet? ────────────────────
+            c_has_simp = (self.sim_state["C"] == "ACTIVE"
+                          and self.simp_pa["C"] is not None)
+            p_has_simp = (self.sim_state["P"] == "ACTIVE"
+                          and self.simp_pa["P"] is not None)
+
+            t = self.t
+
+            # Container — build a packet only once CSV data is available.
+            # The state machine runs every tick; emission follows the rate schedule.
+            line_c = None
+            if c_has_simp:
+                pres_c = self._pressure("C", t)
+                alt_c = self._altitude("C", pres_c)
+                self._advance_states(alt_c, t)
+                if self._container_due(t):
+                    line_c = self._container_line(t, alt_c, pres_c)
+
+            # PocketQube
+            line_p = None
+            if (p_has_simp
+                    and self.t_release is not None and t >= self.t_release):
+                dt_rel = t - self.t_release
+                pres_p = self._pressure("P", t)
+                alt_p = self._altitude("P", pres_p)
+                line_p = self._pq_line(t, alt_p, pres_p, dt_rel)
+
+            self.t += dt
+
+        if line_c is not None:
+            self._emit("C", line_c)
+        if line_p is not None:
+            self._emit("P", line_p)
+
+    def run(self):
+        self._status("Virtual CanSat: started (PQ 4 Hz, container 4 Hz -> 1 Hz 5 s "
+                     "after release, two vehicles, parallel radios). Press SIM ENABLE "
+                     "→ SIM ACTIVATE, then start the SIMP stream to drive the mission")
+        while not self.stop_ev.is_set():
+            self.step()
+            if self.stop_ev.wait(self.DT / self.speed):
+                break
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SimpProfileSender — GS8, 1 Hz, deadline-based (no accumulated drift)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SimpProfileSender(threading.Thread):
+    """
+    sleep(1.0) per loop accumulates drift because the send time is not subtracted — a
+    200 s profile would be off by several seconds.  So an absolute deadline is computed
+    and awaited (next_deadline += 1.0) to keep the cadence constant across the file.
+    """
+
+    def __init__(self, rows, rx_q, stop_ev):
+        super().__init__(daemon=True, name="simp-sender")
+        self.rows = rows                     # [(raw_text, value_float)]
+        self.rx_q = rx_q
+        self.stop_ev = stop_ev
+        self.pause_ev = threading.Event()
+        self.sent = 0
+        self._stamps = collections.deque(maxlen=SIMP_RATE_WINDOW + 1)
+
+    def pause(self):
+        self.pause_ev.set()
+
+    def resume(self):
+        self.pause_ev.clear()
+
+    @property
+    def paused(self):
+        return self.pause_ev.is_set()
+
+    def _rate_stats(self):
+        """Return (mean_interval, achieved_hz, max_abs_drift) from the latest samples."""
+        if len(self._stamps) < 2:
+            return None, None, None
+        gaps = [b - a for a, b in zip(self._stamps, list(self._stamps)[1:])]
+        mean = sum(gaps) / len(gaps)
+        drift = max(abs(g - SIMP_PERIOD_S) for g in gaps)
+        return mean, (1.0 / mean if mean > 0 else None), drift
+
+    def run(self):
+        total = len(self.rows)
+        self.rx_q.put(("STATUS", None,
+                       f"SIMP: streaming {total} rows at 1 Hz (GS8)", None))
+        t0 = time.monotonic()
+        next_deadline = time.monotonic()
+        for i, (raw_v, val) in enumerate(self.rows, start=1):
+            if self.stop_ev.is_set():
+                break
+            # Paused — reset the deadline so counting restarts as soon as Resume is pressed
+            while self.pause_ev.is_set():
+                if self.stop_ev.wait(0.05):
+                    break
+                next_deadline = time.monotonic()
+            if self.stop_ev.is_set():
+                break
+
+            wait = next_deadline - time.monotonic()
+            if wait > 0 and self.stop_ev.wait(wait):
+                break
+            # Check pause again after the deadline wait so Pause takes effect immediately
+            # instead of slipping one more row
+            while self.pause_ev.is_set():
+                if self.stop_ev.wait(0.05):
+                    break
+                next_deadline = time.monotonic()
+            if self.stop_ev.is_set():
+                break
+
+            now = time.monotonic()
+            self._stamps.append(now)
+            self.sent = i
+            mean, hz, drift = self._rate_stats()
+            # Hand the uplink job to the UI thread through the telemetry queue
+            # (tkinter is not thread-safe — never call a widget/after from this thread)
+            self.rx_q.put(("SIMP_SAMPLE", None,
+                           {"row": i, "total": total, "pressure": val,
+                            "wire_value": raw_v,
+                            "altitude": pressure_pa_to_alt(val),
+                            "elapsed": now - t0,
+                            # cumulative drift vs the ideal schedule — the figure that
+                            # really proves 1 Hz to the judges (not an instantaneous value)
+                            "cum_drift": (now - t0) - (i - 1) * SIMP_PERIOD_S,
+                            "mean_interval": mean, "hz": hz, "drift": drift},
+                           None))
+            next_deadline += SIMP_PERIOD_S
+            # if far behind (machine stalled), pull the deadline back to now
+            if next_deadline < time.monotonic() - SIMP_PERIOD_S:
+                next_deadline = time.monotonic() + SIMP_PERIOD_S
+
+        done = "complete" if self.sent >= total else f"stopped at row {self.sent}"
+        mean, hz, drift = self._rate_stats()
+        rate_txt = "" if mean is None else \
+            f" — achieved {hz:.4f} Hz (mean {mean:.4f} s, drift {drift * 1000:.0f} ms)"
+        self.rx_q.put(("SIMP_DONE", None, f"SIMP: {done}{rate_txt}", None))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Ground-station apogee detection (was the ALTITUDE tab)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ApogeeTracker:
+    """
+    Detect apogee from the container altitude sequence. Latches once per mission:
+    after climbing above APOGEE_ASCENT_M and falling more than APOGEE_DROP_M from the peak,
+    apogee = highest peak seen, then fixed (descent noise does not move it).
+    """
+
+    def __init__(self):
+        self.max_alt = None
+        self.apogee = None
+
+    def reset(self):
+        self.max_alt = None
+        self.apogee = None
+
+    def feed(self, alt, state=None):
+        """Return True only "on the latch" so the caller logs exactly once."""
+        if alt is None:
+            return False
+        if self.apogee is not None:
+            # noise during ascent may latch too early — if a higher value appears, raise the line
+            if alt > self.apogee:
+                self.apogee = self.max_alt = alt
+            return False
+        if self.max_alt is None or alt > self.max_alt:
+            self.max_alt = alt
+        if self.max_alt >= APOGEE_ASCENT_M and (
+                alt <= self.max_alt - APOGEE_DROP_M):
+            self.apogee = self.max_alt
+            return True
+        # the FSW says APOGEE has passed (e.g. the peak packet was lost) — trust STATE
+        if (str(state or "").strip().upper() in ("APOGEE", "PQ_RELEASE", "LANDED")
+                and self.max_alt >= APOGEE_ASCENT_M):
+            self.apogee = self.max_alt
+            return True
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PocketQube state derivation (Task 3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+PQ_LANDED_ALT_M = 3.0       # below this = on the ground (barometer noise guard)
+
+
+def pq_state_from_packet(d, cam_turn_seen=False, landed_latched=False):
+    """
+    The PocketQube telemetry format in the Mission Guide **has no STATE column**,
+    so we infer it from the MECH_STATE bits, which are "evidence the mechanism worked",
+    not a guess that a command was sent:
+
+        RELEASED      separated from the container (PQ packets are arriving)
+        SOLAR_DEPLOY  bit 0 and/or bit 1 = solar panels deployed
+        BOOM_DEPLOY   bit 2 = boom actually deployed (not when commanded)
+        CAMERA_TURN   the CAM_SET command has rotated the camera
+        LANDED        reached the ground
+
+    bit 3 (camera recording) is set from separation onward, so it cannot indicate CAMERA_TURN
+    — we look at the CMD_ECHO of CAM_SET instead.
+
+    >>> If the flight software ever adds a real STATE column to the PQ packet,
+    >>> switch to reading it directly in the block below — nothing else needs to change.
+    """
+    direct = d.get("STATE")
+    if direct:
+        s = str(direct).strip().upper()
+        if s in PQ_STATES:
+            return s
+
+    # LANDED is a latch — once on the ground, ±1 m of noise must not bounce it back
+    alt = to_float(d.get("ALTITUDE"))
+    if landed_latched or (alt is not None and alt <= PQ_LANDED_ALT_M):
+        return "LANDED"
+
+    m = d.get("_MECH")
+    echo = echo_token(str(d.get("CMD_ECHO", "")))
+    if cam_turn_seen or echo.startswith(CAM_TURN_ECHOES):
+        return "CAMERA_TURN"
+    if m is None:
+        return "RELEASED"
+    if (m >> PQ_BIT_BOOM) & 1:
+        return "BOOM_DEPLOY"
+    if ((m >> PQ_BIT_SOLAR_1) & 1) or ((m >> PQ_BIT_SOLAR_2) & 1):
+        return "SOLAR_DEPLOY"
+    return "RELEASED"
+
+
+
+def tile_count_for_box(lat_a, lon_a, lat_b, lon_b, z0, z1):
+    """Estimate the number of tiles to download (slippy map) — shown before starting."""
+    total = 0
+    lat_top, lat_bot = max(lat_a, lat_b), min(lat_a, lat_b)
+    lon_l, lon_r = min(lon_a, lon_b), max(lon_a, lon_b)
+    for z in range(int(z0), int(z1) + 1):
+        n = 2 ** z
+        x0 = int((lon_l + 180.0) / 360.0 * n)
+        x1 = int((lon_r + 180.0) / 360.0 * n)
+        try:
+            y0 = int((1.0 - math.asinh(math.tan(math.radians(lat_top)))
+                      / math.pi) / 2.0 * n)
+            y1 = int((1.0 - math.asinh(math.tan(math.radians(lat_bot)))
+                      / math.pi) / 2.0 * n)
+        except Exception:
+            continue
+        total += (abs(x1 - x0) + 1) * (abs(y1 - y0) + 1)
+    return total
+
+
+def map_cache_tile_count(path=MAP_DB_PATH):
+    """Number of tiles in the cache — None if the file is missing/unreadable."""
+    if not os.path.exists(path):
+        return None
+    try:
+        con = sqlite3.connect(path)
+        try:
+            return con.execute(SQL_TILE_COUNT).fetchone()[0]
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Web adaptation — everything below replaces the non-UI half of GCSApp
+# ══════════════════════════════════════════════════════════════════════════════
+
+POLL_PERIOD_S = 0.120       # GCSApp._poll re-armed itself with root.after(120) — same cadence
+STATUS_PERIOD_S = 0.25      # web only: how often a status snapshot is pushed to the browsers
+# The Tk app has two TELEMETRY LOG boxes (C, P) of LOG_MAX_LINES each — so does the web
+TELEMETRY_LOG_MAX = LOG_MAX_LINES
+MAX_PROFILE_BYTES = 5 * 1024 * 1024     # web only: largest profile file accepted from the browser
+MAP_TRACK_MAX = 2000        # GCSApp._update_map keeps the newest 2000 track points
+MAP_CACHE_WORKERS = 8       # web only: parallel tile downloads for CACHE MAP
+MAP_CACHE_TIMEOUT_S = 15    # web only: per-tile HTTP timeout
+
+# fields kept in the per-source history (GCSApp._append_history skips these)
+HISTORY_SKIP = ("ID", "MODE", "STATE", "CMD_ECHO", "MECH_STATE", "GNSS_TIME")
+HISTORY_FIELDS = {"C": [f for f in CONTAINER_FIELDS if f not in HISTORY_SKIP],
+                  "P": [f for f in PQ_FIELDS if f not in HISTORY_SKIP]}
+
+# CONTAINER tab plots — GCSApp._build_container_tab (2x2, every trace the container colour)
+CONTAINER_PLOTS = [("ALTITUDE", "Altitude", "m"),
+                   ("TEMPERATURE", "Temperature", "°C"),
+                   ("PRESSURE", "Pressure", "Pa"),
+                   ("BATT_V", "Battery voltage", "V")]
+
+# POCKETQUBE tab "GS4 · REAL-TIME PLOTS" — GCSApp._build_pq_tab: 3 tabs, each a 2x2 grid
+_PC = VEHICLE_COLOR["P"]
+_AX, _AY, _AZ = AXIS_COLORS
+PQ_PLOT_TABS = [
+    ("Tab 1 · Basic", [
+        ("ALTITUDE",    "Altitude",          "m",
+         [("ALTITUDE",    "Altitude",  _PC)]),
+        ("TEMPERATURE", "Temperature",       "°C",
+         [("TEMPERATURE", "Temp",      _PC)]),
+        ("VOLTAGE",     "Battery voltage",   "V",
+         [("VOLTAGE",     "Voltage",   _PC)]),
+        ("CURRENT",     "Battery current",   "mA",
+         [("CURRENT",     "Current",   _PC)]),
+    ]),
+    ("Tab 2 · IMU", [
+        ("ROT",  "Rotation rate",  "deg/s",
+         [("ROT_RATE_X", "X", _AX),
+          ("ROT_RATE_Y", "Y", _AY),
+          ("ROT_RATE_Z", "Z", _AZ)]),
+        ("ACC",  "Acceleration",   "m/s²",
+         [("ACCEL_X", "X", _AX),
+          ("ACCEL_Y", "Y", _AY),
+          ("ACCEL_Z", "Z", _AZ)]),
+        ("MAG",  "Magnetometer",   "mGauss",
+         [("MAG_X", "X", _AX),
+          ("MAG_Y", "Y", _AY),
+          ("MAG_Z", "Z", _AZ)]),
+        ("SOLAR", "Solar panels",  "V",
+         [("SOLAR_1", "Panel 1", _PC),
+          ("SOLAR_2", "Panel 2", _AY)]),
+    ]),
+    ("Tab 3 · GNSS", [
+        ("GNSS_ALTITUDE",  "GNSS altitude",   "m",
+         [("GNSS_ALTITUDE",  "Alt",  _PC)]),
+        ("GNSS_LATITUDE",  "Latitude",        "deg",
+         [("GNSS_LATITUDE",  "Lat",  _PC)]),
+        ("GNSS_LONGITUDE", "Longitude",       "deg",
+         [("GNSS_LONGITUDE", "Lon",  _PC)]),
+        ("GNSS_SATS",      "Satellites",      "count",
+         [("GNSS_SATS",      "Sats", _PC)]),
+    ]),
+]
+
+# CACHE MAP: tables identical to tkintermapview's OfflineLoader, so a map_cache.db
+# made by the Tk GCS works here and the other way round
+SQL_MAP_SERVER_TABLE = ("CREATE TABLE IF NOT EXISTS server ("
+                        "url VARCHAR(300) PRIMARY KEY NOT NULL, "
+                        "max_zoom INTEGER NOT NULL)")
+SQL_MAP_TILES_TABLE = ("CREATE TABLE IF NOT EXISTS tiles ("
+                       "zoom INTEGER NOT NULL, x INTEGER NOT NULL, y INTEGER NOT NULL, "
+                       "server VARCHAR(300) NOT NULL, tile_image BLOB NOT NULL, "
+                       "CONSTRAINT fk_server FOREIGN KEY (server) REFERENCES server (url), "
+                       "CONSTRAINT pk_tiles PRIMARY KEY (zoom, x, y, server))")
+SQL_MAP_SECTIONS_TABLE = ("CREATE TABLE IF NOT EXISTS sections ("
+                          "position_a VARCHAR(100) NOT NULL, position_b VARCHAR(100) NOT NULL, "
+                          "zoom_a INTEGER NOT NULL, zoom_b INTEGER NOT NULL, "
+                          "server VARCHAR(300) NOT NULL, "
+                          "CONSTRAINT fk_server FOREIGN KEY (server) REFERENCES server (url), "
+                          "CONSTRAINT pk_tiles PRIMARY KEY (position_a, position_b, zoom_a, "
+                          "zoom_b, server))")
+SQL_MAP_SERVER_INSERT = "INSERT OR IGNORE INTO server (url, max_zoom) VALUES (?, ?)"
+SQL_MAP_TILE_EXISTS = "SELECT 1 FROM tiles WHERE zoom=? AND x=? AND y=? AND server=?"
+SQL_MAP_TILE_INSERT = ("INSERT OR IGNORE INTO tiles (zoom, x, y, server, tile_image) "
+                       "VALUES (?, ?, ?, ?, ?)")
+SQL_MAP_TILE_GET = ("SELECT tile_image FROM tiles WHERE zoom=? AND x=? AND y=? "
+                    "AND server=?")
+SQL_MAP_TILE_GET_ANY = "SELECT tile_image FROM tiles WHERE zoom=? AND x=? AND y=? LIMIT 1"
+
+# argument prompts — from GCSApp._send_spec (the browser shows them in its prompt)
+ARG_PROMPTS = {"time": "GPS, or a UTC time HH:MM:SS:",
+               "angle": "Camera rotation, degrees clockwise (e.g. 5):",
+               "pascals": "Pressure (Pa):",
+               "mech": "Mechanism + state (e.g. BOOM,ON):"}
+
+# on-screen mode badge — from GCSApp._refresh_sim_controls (texts + theme colour key)
+#   UNSELECTED --SIM--> SIM --SIM ENABLE--> SIM_ENABLED --SIM ACTIVATE--> SIM_MODE
+#                           \--FLIGHT ENABLE--> FLIGHT_ENABLED --FLIGHT ACTIVATE--> FLIGHT_MODE
+#   SIM DISABLE / FLIGHT DISABLE -> UNSELECTED. Telemetry is shown only in SIM_MODE / FLIGHT_MODE.
+UI_MODE_TEXT = {
+    "UNSELECTED": "MODE: NaN",
+    "SIM": "MODE: SIM",
+    "SIM_ENABLED": "MODE: SIM ENABLED (press SIM ACTIVATE)",
+    "SIM_MODE": "MODE: SIMULATION (simulated data)",
+    "FLIGHT_ENABLED": "MODE: FLIGHT ENABLED (press FLIGHT ACTIVATE)",
+    "FLIGHT_MODE": "MODE: FLIGHT (real flight)",
+}
+UI_MODE_LEVEL = {"UNSELECTED": "idle", "SIM": "warn", "SIM_ENABLED": "warn",
+                 "SIM_MODE": "ok", "FLIGHT_ENABLED": "warn", "FLIGHT_MODE": "ok"}
+MODE_COMMANDS = ("SIM", "SIM ENABLE", "SIM ACTIVATE", "SIM DISABLE",
+                 "FLIGHT ENABLE", "FLIGHT ACTIVATE", "FLIGHT DISABLE")
+
+CAM_STEP_DEG = 10           # CAM_SET button: one press = 10 degrees clockwise
+CAM_ANGLE_MAX = 360         # FSW COMMANDS.md: CAM_SET <deg> integer, +/-360
+TYPED_ALIASES = {"MAC": "MEC"}      # team slides say MAC; Mission Guide / wire say MEC
+
+# FSW SEQUENCE rows — from GCSApp._build_sidebar
+SEQ_TITLES = (("apogee", "1 Apogee"), ("release", "2 PQ release"),
+              ("solar", "3 Solar"), ("boom", "4 Boom"), ("cam", "5 Camera"))
+
+COMMAND_SPECS = {c["name"]: c for _g, cmds in COMMAND_GROUPS for c in cmds}
+
+# buttons that return from _send_spec before its argument prompt / destructive
+# confirmation (bare SIM, SIMP, and the arming gate) — the browser skips its
+# dialogs for exactly these, as the Tk app did
+DIALOG_FREE_COMMANDS = ("SIM", "SIMP", "SIM ENABLE", "SIM ACTIVATE", "SIM DISABLE")
+
+
+class NotifyingQueue(queue.Queue):
+    """queue.Queue that calls notify() after every put.
+
+    LinkReader, VirtualPayload and SimpProfileSender are unchanged and still just
+    put() on rx_q; the notify hook wakes the asyncio drain task at once, so a packet
+    is parsed and broadcast as soon as it arrives instead of on the next 120 ms poll."""
+
+    def __init__(self, notify):
+        super().__init__()
+        self._notify = notify
+
+    def put(self, item, block=True, timeout=None):
+        super().put(item, block, timeout)
+        self._notify()
+
+
+def packet_values(vehicle, d):
+    """Raw field values of one packet in log order: CONTAINER_FIELDS, or
+    PQ_FIELDS + PQ_TRAILING (trailing groups come from _EXTRA, split the way
+    the deleted PacketTable._value split them)."""
+    if vehicle == "C":
+        return [str(d.get(f, "")).strip() for f in CONTAINER_FIELDS]
+    extra = d.get("_EXTRA", []) or []
+    vals = [str(d.get(f, "")).strip() for f in PQ_FIELDS]
+    vals.append(",".join(extra[:IMAGE_STAB_FIELD_COUNT]))
+    vals.append(",".join(extra[IMAGE_STAB_FIELD_COUNT:]))
+    return vals
+
+
+def telemetry_text(vehicle, d):
+    """GCSApp._telemetry_text — the single telemetry formatter: 'FIELD=value' pairs
+    in Mission Guide field order (CONTAINER_FIELDS / PQ_FIELDS), two spaces apart."""
+    fields = CONTAINER_FIELDS if vehicle == "C" else PQ_FIELDS
+    return "  ".join(f"{f}={d.get(f, '')}" for f in fields)
+
+
+def _tile_xy(lat, lon, z):
+    """Slippy-map tile coordinates (float), as tkintermapview.decimal_to_osm."""
+    n = 2.0 ** z
+    x = (lon + 180.0) / 360.0 * n
+    y = (1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n
+    return x, y
+
+
+def read_cached_tile(z, x, y, path=MAP_DB_PATH):
+    """One tile image from the map cache (bytes) or None — serves MAP: OFFLINE."""
+    if not os.path.exists(path):
+        return None
+    try:
+        con = sqlite3.connect(path)
+        try:
+            row = con.execute(SQL_MAP_TILE_GET, (z, x, y, MAP_TILE_SERVER)).fetchone()
+            if row is None:
+                row = con.execute(SQL_MAP_TILE_GET_ANY, (z, x, y)).fetchone()
+            return row[0] if row else None
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
+def match_command_text(txt):
+    """Typed text -> (spec, arg) when it starts with a command name from
+    COMMAND_GROUPS (longest name wins, commas and spaces both separate words,
+    case-insensitive; a leading MAC is read as MEC). Local FLIGHT ... names match
+    too, so typing a command does exactly what its button does. Returns None
+    otherwise, and the caller falls back to the original free-text path."""
+    words = str(txt).replace(",", " ").split()
+    if words and words[0].upper() in TYPED_ALIASES:
+        words[0] = TYPED_ALIASES[words[0].upper()]
+    norm = " ".join(words)
+    up = norm.upper()
+    best = None
+    for name, spec in COMMAND_SPECS.items():
+        n = name.upper()
+        if (up == n or up.startswith(n + " ")) and (
+                best is None or len(n) > len(best[0]["name"])):
+            best = (spec, norm[len(n):].strip())
+    return best
+
+
+def hms_seconds(text):
+    """'HH:MM:SS[.ff]' or 'HHMMSS[.ff]' (NMEA GNSS_TIME / ST argument) ->
+    seconds of the day, or None if it is not a valid time of day."""
+    s = str(text or "").strip()
+    if not s or s.upper() in NAN_TOKENS:
+        return None
+    s = s.split(".")[0]
+    parts = s.split(":") if ":" in s else (
+        [s[0:2], s[2:4], s[4:6]] if len(s) == 6 else [])
+    if len(parts) != 3 or not all(p.isdigit() and 1 <= len(p) <= 2 for p in parts):
+        return None
+    hh, mm, ss = (int(p) for p in parts)
+    if hh > 23 or mm > 59 or ss > 59:
+        return None
+    return hh * 3600 + mm * 60 + ss
+
+
+def hms_text(sec):
+    sec = int(sec) % 86400
+    return f"{sec // 3600:02d}:{sec // 60 % 60:02d}:{sec % 60:02d}"
+
+
+def _finite(v):
+    """JSON-safe number: NaN / inf / non-numbers -> None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def web_config(links_cfg, ports):
+    """Everything the browser needs to build its UI — taken straight from the
+    constants above, nothing invented on the browser side."""
+    theme = THEMES["light"]
+    return {
+        "type": "config",
+        "team_id": TEAM_ID, "container_id": CONTAINER_ID, "pq_id": PQ_ID,
+        "container_fields": CONTAINER_FIELDS,
+        "pq_fields": PQ_FIELDS,
+        "pq_trailing": PQ_TRAILING,
+        "pq_log_fields": PQ_FIELDS + PQ_TRAILING,
+        "units": UNITS,
+        "command_groups": [{"group": g, "tab": CMD_TAB_LABEL.get(g, g),
+                            "commands": cmds} for g, cmds in COMMAND_GROUPS],
+        "arg_prompts": ARG_PROMPTS,
+        "dialog_free_commands": list(DIALOG_FREE_COMMANDS),
+        "cam_step_deg": CAM_STEP_DEG,
+        "cam_angle_max": CAM_ANGLE_MAX,
+        "container_states": CONTAINER_STATES,
+        "pq_states": PQ_STATES,
+        "state_colors": STATE_COLORS,
+        "state_hint": STATE_HINT,
+        "mech_bits": MECH_BITS,
+        "vehicle_color": VEHICLE_COLOR,
+        "vehicle_name": VEHICLE_NAME,
+        "vehicle_title": VEHICLE_TITLE,
+        "radios": list(RADIOS),
+        "radio_label": RADIO_LABEL,
+        "link_keys": list(LINK_KEYS),
+        "links": {k: {"vehicle": c["vehicle"], "radio": c["radio"],
+                      "port": c.get("port", ""), "baud": c["baud"],
+                      "channel": str(c.get("channel", "")),
+                      "ident_key": "netid" if c["radio"] == "XBEE" else "peer_mac",
+                      "ident": str(c.get("netid" if c["radio"] == "XBEE"
+                                         else "peer_mac", ""))}
+                  for k, c in links_cfg.items()},
+        "ports": ports,
+        "display_sources": list(DISPLAY_SOURCES),
+        "display_source_label": DISPLAY_SOURCE_LABEL,
+        "sim_sources": list(SIM_SOURCES),
+        "sim_source_label": SIM_SOURCE_LABEL,
+        "seq_titles": [list(t) for t in SEQ_TITLES],
+        "theme": theme,
+        "event_tag_colors": {t: theme[k] for t, k in EVENT_TAG_COLORS.items()},
+        "chart_points": CHART_POINTS,
+        "log_max_lines": LOG_MAX_LINES,
+        "telemetry_log_max": TELEMETRY_LOG_MAX,
+        "stale_link_s": STALE_LINK_S,
+        "cmd_timeout_s": CMD_TIMEOUT_S,
+        "apogee_color": APOGEE_COLOR,
+        "release_line_color": RELEASE_LINE_COLOR,
+        "apogee_release_frac": APOGEE_RELEASE_FRAC,
+        "none_text": NONE_TEXT,
+        "serial_ok": SERIAL_OK,
+        # ── layout / plots, all from the Tk builders ──────────────────────
+        "cmd_fixed_cols": CMD_FIXED_COLS,
+        "sidebar_width": SIDEBAR_WIDTH,
+        "font_min": FONT_MIN,
+        "telem_col_min_w": TELEM_COL_MIN_W,
+        "event_log_min_lines": EVENT_LOG_MIN_LINES,
+        "container_plots": CONTAINER_PLOTS,
+        "pq_plot_tabs": PQ_PLOT_TABS,
+        "history_fields": HISTORY_FIELDS,
+        "axis_colors": AXIS_COLORS,
+        "plot": {"title": PLOT_TITLE_SIZE, "title_min": PLOT_TITLE_MIN,
+                 "label": PLOT_LABEL_SIZE, "tick": PLOT_TICK_SIZE,
+                 "line": PLOT_LINEWIDTH, "axis": PLOT_AXIS_WIDTH,
+                 "xlabel": PLOT_XLABEL},
+        "pkt_table_pt": PKT_TABLE_PT,
+        "pkt_value_chars": PKT_VALUE_CHARS,
+        "sim_state_text": SIM_STATE_TEXT,
+        "map_home": MAP_HOME,
+        "map_tile_server": MAP_TILE_SERVER,
+        "map_cache_defaults": {"zoom_min": MAP_CACHE_ZOOM_MIN,
+                               "zoom_max": MAP_CACHE_ZOOM_MAX,
+                               "radius_deg": MAP_CACHE_RADIUS_DEG,
+                               "tile_bytes_est": MAP_TILE_BYTES_EST},
+        "map_db_path": MAP_DB_PATH,
+    }
+
+
+class GroundStation:
+    """The non-UI logic of GCSApp, single-threaded on the asyncio event loop
+    (the loop plays the role of the Tk UI thread). Every Tk StringVar became a
+    plain attribute; every widget update became a message handed to emit()."""
+
+    def __init__(self, config_path=CONFIG_FILE, sim_speed=1.0):
+        self.config_path = config_path
+        self.sim_speed = sim_speed
+
+        # ── event loop plumbing (set by attach()) ─────────────────────────
+        self.loop = None
+        self._wake_ev = None
+        self._emit_fn = None
+        self._tasks = []
+        self._shut_down = False
+        self._last_status = 0.0
+
+        # ── browser-facing backlogs (replayed to a newly connected browser) ─
+        self.event_backlog = collections.deque(maxlen=LOG_MAX_LINES)
+        # one per TELEMETRY LOG box (C, P) per display source
+        self.telemetry_backlog = {s: {v: collections.deque(maxlen=TELEMETRY_LOG_MAX)
+                                      for v in ("C", "P")}
+                                  for s in DISPLAY_SOURCES}
+
+        # ── map (GCSApp: map_mode StringVar, _track, cache_cancel) ────────
+        self.map_tiles = map_cache_tile_count()
+        self.map_mode = "OFFLINE" if self.map_tiles else "ONLINE"
+        self._track = []
+        self.cache_cancel = threading.Event()
+        self.cache_job = None            # {"running", "stat", "value", "max"}
+
+        self.rx_q = NotifyingQueue(self._wake)
+        self.links = LinkManager(self.rx_q)
+        ok, msg = self.links.load_config(self.config_path)
+        self._log(msg, "sys" if ok else "warn")
+
+        # ── per-link statistics (all 4 links kept — evidence for the judges) ─
+        self.link_stats = {k: dict(rx=0, dup=0, chk_fail=0, first=0,
+                                   last_rx=None, connected=False,
+                                   status="disconnected") for k in LINK_KEYS}
+
+        # ── data stores per "display source" ────────────────────────────────
+        #   MERGED = first copy wins (original dedupe behaviour, used as the GS11 counter)
+        #   XBEE / ESPNOW = only what arrived on that band (lets the judges view each link)
+        self.latest_src = {s: {"C": None, "P": None} for s in DISPLAY_SOURCES}
+        self.history_src = {s: {"C": collections.defaultdict(list),
+                                "P": collections.defaultdict(list)}
+                            for s in DISPLAY_SOURCES}
+        self.seen_src = {s: collections.OrderedDict() for s in DISPLAY_SOURCES}
+        self.count_src = {s: {"C": 0, "P": 0} for s in DISPLAY_SOURCES}
+        # GS11 — packets actually received after dedupe (= the MERGED counter)
+        self.gs11 = self.count_src["MERGED"]
+        # measured receive rate: monotonic arrival times of MERGED (deduped) packets
+        self.rx_stamps = {"C": collections.deque(), "P": collections.deque()}
+        self._last_rx_mono = {"C": None, "P": None}
+        # event log: previous derived state per vehicle + uplink reminder state
+        self._remind_after = {"BOOM": None, "CAM": None}
+        self._reset_event_state()
+
+        # ── logging (GS13) ────────────────────────────────────────────────
+        self.csv_files = {"C": None, "P": None}
+        self.csv_writers = {"C": None, "P": None}
+        self.csv_paths = {
+            "C": os.path.join(APP_DIR, f"Flight_{CONTAINER_ID}.csv"),
+            "P": os.path.join(APP_DIR, f"Flight_{PQ_ID}.csv"),
+        }
+        self.csv_paths_sim = {v: os.path.join(APP_DIR, f"SIM_{os.path.basename(p)}")
+                              for v, p in self.csv_paths.items()}
+        self.log_is_sim = False
+        self.pq_extra_cols = None
+        self.logging = False
+
+        # ── uplink / commands ─────────────────────────────────────────────
+        self.pending_cmd = None
+        # two latches for the PQ state machine (see pq_state_from_packet)
+        self.cam_turn_seen = False
+        self.pq_landed_seen = False
+
+        # ── simulation ────────────────────────────────────────────────────
+        self.sim = None
+        self.sim_stop = threading.Event()
+        self.simp = None
+        self.simp_stop = threading.Event()
+        self.sim_state = "IDLE"          # ground-station-side arming state
+        self.profile = None              # result of load_pressure_profile()
+        self.profile_rows = None         # [(text, value)] already in Pa
+        self._pending_convert = None     # profile waiting for the kPa/hPa -> Pa answer
+
+        self._pq_arm_tries = 0
+        self._pq_arm_t = 0.0
+        self._hil_expected = None
+        self._hil_base_alt = None
+        self._reset_altitude_state()
+
+        # ── former Tk variables ───────────────────────────────────────────
+        self.display_source = "MERGED"
+        self.sim_source = "FILE"
+        self.up_radio = RADIOS[0]
+        self.up_target = "C"
+        self.ack_text = "No pending command"
+        self.ui_mode = "UNSELECTED"
+        # ── CMD-uplink mode gate: nothing is displayed until SIM ACTIVATE /
+        #    FLIGHT ACTIVATE opens it (see UI_MODE_TEXT for the sequence) ──
+        self.telemetry_on = False
+        self._gate_noted = False         # "telemetry received but not shown" logged once
+        self._simp_autostart = False     # SIM ACTIVATE → start SIMP once armed + profile loaded
+        self._simp_wait_noted = False
+        # newest packet per vehicle, whether displayed or not: ACK, SIM arming
+        # evidence and the ST GPS time read this, never the display stores
+        self.rx_latest = {"C": None, "P": None}
+        # ST: ground-station clock set by the last ST that went out
+        self.st_clock = None             # {"source", "base", "mono", "vehicle"}
+        self.cam_total_deg = 0           # sum of CAM_SET rotations sent this mission
+        self.sim_warn = ""
+        self.simp_path = ""
+        self.simp_info = "No profile file loaded"
+        self.simp_stat = "idle"
+        self.simp_rate = f"achieved rate {NONE_TEXT}"
+        self.hil_text = "HIL check —"
+        self.validate_warns = None
+        self.last_wire = None
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Event loop plumbing (replaces root.after / mainloop)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def attach(self, loop, emit):
+        """Bind to the running asyncio loop; emit(msg_dict) broadcasts to browsers."""
+        self.loop = loop
+        self._wake_ev = asyncio.Event()
+        self._emit_fn = emit
+
+    def start(self, autostart_sim=False, profile=None, log_csv=False,
+              autoarm=False):
+        """Was the tail of GCSApp.__init__ plus main(): validation warnings, the
+        poll loop, and the --sim / --profile / --log startup actions (same delays)."""
+        for w in self.links.validate():
+            self._log(w, "warn")
+        self._tasks = [self.loop.create_task(self._drain_loop()),
+                       self.loop.create_task(self._tick_loop())]
+        if log_csv:
+            self._after(0.2, self._start_log)
+        if profile:
+            self.simp_path = profile
+            self._after(0.3, lambda: self._load_profile(profile))
+        if autostart_sim or autoarm:
+            self._after(0.4, self._start_sim)
+        if autoarm:
+            # scripted operator (--auto-arm only): the same buttons, in the CMD-uplink
+            # order, through the normal command path — the payload still enforces the
+            # arming gate itself, and SIM ACTIVATE starts the SIMP stream
+            self._after(0.8, lambda: self.send_command("SIM"))
+            self._after(1.0, lambda: self.send_command("SIM ENABLE"))
+            self._after(2.0, lambda: self.send_command("SIM ACTIVATE"))
+
+    def _wake(self):
+        """Called from producer threads after every rx_q.put()."""
+        loop, ev = self.loop, self._wake_ev
+        if loop is None or ev is None:
+            return
+        try:
+            loop.call_soon_threadsafe(ev.set)
+        except RuntimeError:
+            pass                         # loop already closed (shutdown)
+
+    async def _drain_loop(self):
+        """Drain rx_q the moment something is put on it."""
+        while True:
+            await self._wake_ev.wait()
+            self._wake_ev.clear()
+            self._safe_pump()
+            if not self.rx_q.empty():
+                self._wake_ev.set()      # pump() caps one pass at 400 items
+                await asyncio.sleep(0)
+
+    async def _tick_loop(self):
+        """The old 120 ms _poll: timeouts, re-arm, reminders run even with no packets."""
+        while True:
+            await asyncio.sleep(POLL_PERIOD_S)
+            self._safe_pump()
+            if time.monotonic() - self._last_status >= STATUS_PERIOD_S:
+                self.emit_status()
+
+    def _safe_pump(self):
+        try:
+            self.pump()
+        except Exception as e:
+            self._log(f"poll error: {e}", "err")
+
+    def _after(self, delay_s, fn):
+        """root.after() replacement — returns a cancellable asyncio TimerHandle."""
+        def run():
+            try:
+                fn()
+            except Exception as e:
+                self._log(f"timer error: {e}", "err")
+        return self.loop.call_later(delay_s, run)
+
+    def _emit(self, msg):
+        if self._emit_fn is not None:
+            self._emit_fn(msg)
+
+    def emit_status(self):
+        self._last_status = time.monotonic()
+        self._emit(self.status())
+
+    def _alert(self, level, title, text):
+        """messagebox.showwarning/showerror replacement — a toast in the browser."""
+        self._emit({"type": "alert", "level": level, "title": title,
+                    "text": text})
+
+    # ── helpers to read data for the selected display source ────────────────
+    def _src(self):
+        s = self.display_source
+        return s if s in DISPLAY_SOURCES else "MERGED"
+
+    def latest(self, vehicle):
+        return self.latest_src[self._src()][vehicle]
+
+    def history(self, vehicle):
+        return self.history_src[self._src()][vehicle]
+
+    def _log(self, msg, tag="info"):
+        """Operator event log (CMD ECHO box): one timestamped line.
+        Tags: sent / ack / state / alert / warn / err / info (legacy sys, tel,
+        cmd are mapped)."""
+        tag = EVENT_TAG_ALIAS.get(tag, tag)
+        if tag not in EVENT_TAG_COLORS:
+            tag = "info"
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        entry = {"type": "log", "t": ts, "tag": tag, "msg": str(msg)}
+        self.event_backlog.append(entry)
+        self._emit(entry)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Altitude / apogee / timer tracking (called per src as packets arrive)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _reset_altitude_state(self):
+        self.alt_series = {s: {"C": [], "P": []} for s in DISPLAY_SOURCES}
+        self.alt_t0 = {s: {"C": None, "P": None} for s in DISPLAY_SOURCES}
+        self.apo_track = {s: ApogeeTracker() for s in DISPLAY_SOURCES}
+        self.pq_t_end = {s: None for s in DISPLAY_SOURCES}
+
+    def _track_altitude(self, src, vehicle, d):
+        now = time.time()
+        if self.alt_t0[src][vehicle] is None:
+            self.alt_t0[src][vehicle] = now       # first packet = start the timer
+        alt = to_float(d.get("ALTITUDE"))
+        if alt is not None:
+            # x = MISSION_TIME (shared clock of both vehicles); falls back to
+            # seconds since this vehicle's first packet if it is not numeric
+            mt = to_float(d.get("MISSION_TIME"))
+            x = mt if mt is not None else now - self.alt_t0[src][vehicle]
+            self.alt_series[src][vehicle].append((x, alt))
+        if vehicle == "C":
+            if self.apo_track[src].feed(alt, d.get("STATE")) and src == "MERGED":
+                ap = self.apo_track[src].apogee
+                self._log(f"APOGEE = {ap:.1f} m  ·  90% line = "
+                          f"{APOGEE_RELEASE_FRAC * ap:.1f} m", "sys")
+        elif (self.pq_t_end[src] is None and alt is not None
+              and alt <= PQ_LANDED_ALT_M
+              and any(a > 20.0 for _, a in self.alt_series[src]["P"])):
+            self.pq_t_end[src] = now              # reached the ground → stop the timer
+
+    def _pq_timer(self):
+        """PocketQube timer text (was the ALTITUDE tab's T+ label)."""
+        src = self._src()
+        t0 = self.alt_t0[src]["P"]
+        if t0 is None:
+            return {"text": f"T+ {NONE_TEXT}", "note": "waiting for first PQ packet"}
+        end = self.pq_t_end[src]
+        el = (end if end is not None else time.time()) - t0
+        m, s = divmod(el, 60)
+        return {"text": f"T+ {int(m):02d}:{s:04.1f}",
+                "note": ("LANDED — timer stopped" if end is not None
+                         else "since first PQ packet")}
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Measured receive rate
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _note_rx(self, vehicle):
+        """Record one deduped packet arrival for the measured-rate readout."""
+        q = self.rx_stamps[vehicle]
+        now = time.monotonic()
+        self._last_rx_mono[vehicle] = now
+        q.append(now)
+        while q and now - q[0] > RATE_WINDOW_S:
+            q.popleft()
+
+    @staticmethod
+    def _rate_from_stamps(stamps):
+        """Packets per second from arrival times: least-squares slope of packet
+        index vs time. Arrivals are stamped when the loop drains the queue,
+        so they can come in bursts; the slope is far less
+        sensitive to that than (n-1)/span. None if fewer than 2 points."""
+        n = len(stamps)
+        if n < 2:
+            return None
+        if n == 2:
+            span = stamps[1] - stamps[0]
+            return 1.0 / span if span > 0 else None
+        t_mean = sum(stamps) / n
+        i_mean = (n - 1) / 2.0
+        var = sum((t - t_mean) ** 2 for t in stamps)
+        if var <= 0:
+            return None
+        cov = sum((t - t_mean) * (i - i_mean) for i, t in enumerate(stamps))
+        return cov / var
+
+    def _rates(self):
+        """Measured receive rate per vehicle over the last RATE_WINDOW_S
+        (deduped packets). None ('-- Hz') when stale (no packet for > STALE_LINK_S)."""
+        now = time.monotonic()
+        out = {}
+        for v in ("C", "P"):
+            q = self.rx_stamps[v]
+            while q and now - q[0] > RATE_WINDOW_S:
+                q.popleft()
+            live = bool(q) and now - q[-1] <= STALE_LINK_S
+            hz = self._rate_from_stamps(list(q)) if live else None
+            out[v] = _finite(hz)
+        return out
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Radio config actions
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _list_ports(self):
+        if not SERIAL_OK:
+            return []
+        try:
+            return [p.device for p in serial.tools.list_ports.comports()]
+        except Exception:
+            return []
+
+    def _refresh_ports(self):
+        ports = self._list_ports()
+        self._emit({"type": "ports", "ports": ports})
+        self._log(f"Ports found: {', '.join(ports) if ports else 'none'}", "sys")
+        return ports
+
+    def _ident_key(self, key):
+        return "netid" if self.links.cfg[key]["radio"] == "XBEE" else "peer_mac"
+
+    def _pull_cfg(self, cfg):
+        """Copy the values typed in the browser into LinkManager.cfg
+        (was: copy the Tk entry-field values)."""
+        for k, vals in (cfg or {}).items():
+            if k not in LINK_KEYS or not isinstance(vals, dict):
+                continue
+            c = self.links.cfg[k]
+            if "port" in vals:
+                c["port"] = str(vals["port"] or "").strip()
+            if "baud" in vals:
+                try:
+                    c["baud"] = int(str(vals["baud"]).strip())
+                except ValueError:
+                    self._log(f"{k}: invalid baud, keeping {c['baud']}", "warn")
+            if "channel" in vals:
+                c["channel"] = str(vals["channel"] or "").strip()
+            if "ident" in vals:
+                c[self._ident_key(k)] = str(vals["ident"] or "").strip()
+
+    def _validate_and_report(self, silent=False, cfg=None):
+        self._pull_cfg(cfg)
+        warns = self.links.validate()
+        self.validate_warns = warns
+        if not silent:
+            for w in warns:
+                self._log(w, "warn")
+            if not warns:
+                self._log("Radio config passed all checks", "sys")
+        return warns
+
+    def _save_config(self, cfg=None):
+        self._validate_and_report(silent=True, cfg=cfg)
+        ok, msg = self.links.save_config(self.config_path)
+        self._log(msg, "sys" if ok else "err")
+
+    def _toggle_link(self, key):
+        if self.links.is_connected(key):
+            ok, msg = self.links.disconnect(key)
+            self.link_stats[key]["connected"] = False
+            self.link_stats[key]["status"] = "disconnected"
+        else:
+            if not SERIAL_OK:
+                self._alert("error", "Radio config",
+                            "pyserial is not installed — pip install pyserial")
+                return
+            warns = self.links.validate()
+            blockers = [x for x in warns if x.startswith(f"[X6] {key}")]
+            if blockers:
+                self._alert("error", "Radio config", "\n".join(blockers))
+                return
+            ok, msg = self.links.connect(key)
+            if ok:
+                self._retire_virtual()
+                self.sim_source = "LINK"
+        self._log(f"{key}: {msg}", "sys" if ok else "err")
+
+    def _connect_all(self):
+        for k in LINK_KEYS:
+            if not self.links.is_connected(k):
+                self._toggle_link(k)
+
+    def _disconnect_all(self):
+        for k in LINK_KEYS:
+            if self.links.is_connected(k):
+                self._toggle_link(k)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Uplink — always goes out on the single selected link
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _selected_link(self, vehicle=None):
+        return link_key(vehicle or self.up_target, self.up_radio)
+
+    def set_uplink(self, radio=None, target=None):
+        if radio in RADIOS:
+            self.up_radio = radio
+        if target in ("C", "P"):
+            self.up_target = target
+
+    def send_command(self, name, arg=None, vehicle=None):
+        """A COMMAND_GROUPS button press. Destructive-command confirmation and
+        the argument prompt happen in the browser before this is called."""
+        spec = COMMAND_SPECS.get(" ".join(str(name or "").split()))
+        if spec is None:
+            self._alert("warning", "Command", f"Unknown command: {name}")
+            return
+        self._send_spec(spec, arg, vehicle)
+
+    def _send_spec(self, spec, arg=None, vehicle=None):
+        name = spec["name"]
+        if name in MODE_COMMANDS:
+            self._mode_command(name)
+            return
+        if name == "SIMP":
+            self._simp_start()
+            return
+
+        # a command that exists on one vehicle only (CAL, ARM, SOLAR_*, BOOM_*,
+        # CAM_SET, ...) always goes to that vehicle, on the selected radio — so
+        # its button works whatever the UPLINK target is (still one link)
+        if len(spec["targets"]) == 1:
+            target = spec["targets"]
+        else:
+            target = vehicle if vehicle in ("C", "P") else self.up_target
+        if target not in spec["targets"]:
+            self._alert(
+                "warning", "Command",
+                f"{spec['name']} applies to "
+                f"{'/'.join(VEHICLE_NAME[v] for v in spec['targets'])} only")
+            return
+        if name == "ST":
+            self._set_time(arg, target)
+            return
+        if name == "CAM_SET":
+            self._cam_set(arg, target)
+            return
+        if spec.get("arg"):
+            if arg is None or not str(arg).strip():
+                self._alert("warning", spec["name"],
+                            f"{spec['name']} needs a value — "
+                            f"{ARG_PROMPTS.get(spec['arg'], 'Value:')}")
+                return
+            arg = str(arg).strip()
+            if spec["arg"] != "mech":
+                arg = arg.replace(",", "")
+            if not arg:
+                return
+        else:
+            arg = None
+        self._dispatch(spec["name"], arg, target, self.up_radio)
+
+    # ── CMD-uplink mode sequence (SIM → SIM/FLIGHT ENABLE → ACTIVATE) ─────
+    def _mode_command(self, name):
+        mode = self.ui_mode
+        if name == "SIM":
+            if mode in ("SIM_MODE", "FLIGHT_MODE"):
+                which = "SIM" if mode == "SIM_MODE" else "FLIGHT"
+                self._alert("warning", "SIM",
+                            f"{which} mode is active — press {which} DISABLE first")
+                return
+            self.ui_mode = "SIM"
+            self._log("LOCAL  SIM — continue with SIM ENABLE (simulation) or "
+                      "FLIGHT ENABLE (real flight)", "info")
+            return
+
+        if name == "FLIGHT ENABLE":
+            if mode not in ("SIM", "FLIGHT_ENABLED"):
+                self._alert("warning", "FLIGHT ENABLE", self._order_hint(mode, "SIM"))
+                return
+            if self.sim is not None and self.sim.is_alive():
+                self._stop_virtual()         # no simulated packets in a flight session
+            self._simp_stop(silent=True)
+            self.ui_mode = "FLIGHT_ENABLED"
+            self._log("LOCAL  FLIGHT ENABLE — flight mode selected (not sent; FSW "
+                      "starts in FLIGHT). Press FLIGHT ACTIVATE to show telemetry", "info")
+            return
+        if name == "FLIGHT ACTIVATE":
+            if mode != "FLIGHT_ENABLED":
+                self._alert("warning", "FLIGHT ACTIVATE",
+                            self._order_hint(mode, "FLIGHT ENABLE"))
+                return
+            self.ui_mode = "FLIGHT_MODE"
+            self._set_telemetry(True, "FLIGHT — real flight telemetry")
+            if not self._any_real_link():
+                self._log("FLIGHT: no radio link connected — press Connect to "
+                          "receive real telemetry", "warn")
+            return
+        if name == "FLIGHT DISABLE":
+            if mode not in ("FLIGHT_ENABLED", "FLIGHT_MODE"):
+                self._alert("warning", "FLIGHT DISABLE", "FLIGHT mode is not selected")
+                return
+            self.ui_mode = "UNSELECTED"
+            self._set_telemetry(False)
+            self._log("LOCAL  FLIGHT DISABLE — start again with SIM", "info")
+            return
+
+        if name == "SIM ENABLE":
+            if mode not in ("SIM", "SIM_ENABLED"):
+                self._alert("warning", "SIM ENABLE", self._order_hint(mode, "SIM"))
+                return
+            if self.sim_source == "LINK":
+                links = self._sim_links()
+                if not links:
+                    self._alert("warning", "SIM ENABLE — LINK",
+                                "LINK: not connected to the CanSat — set the ports in "
+                                "LINKS / RADIO and press Connect first")
+                    self._log(f"LINK: CanSat not connected on {RADIO_LABEL[self.up_radio]} "
+                              "— SIM ENABLE not sent", "err")
+                    return
+                self._log("LINK: CanSat connected via " + ", ".join(links), "sys")
+            if not self._sim_arm("SIM ENABLE"):
+                return
+            self.ui_mode = "SIM_ENABLED"
+            if not self.profile_rows:
+                self._request_profile("SIM ENABLE: choose the judges' pressure "
+                                      "profile file before SIM ACTIVATE")
+            return
+        if name == "SIM ACTIVATE":
+            if mode != "SIM_ENABLED":
+                self._alert("warning", "SIM ACTIVATE",
+                            self._order_hint(mode, "SIM ENABLE"))
+                return
+            if not self._sim_arm("SIM ACTIVATE"):
+                return
+            self.ui_mode = "SIM_MODE"
+            self._set_telemetry(True, "SIMULATION")
+            self._simp_autostart = True
+            self._simp_wait_noted = False
+            if not self.profile_rows:
+                self._request_profile("SIM ACTIVATE: choose the judges' pressure "
+                                      "profile file — SIMP starts as soon as it loads")
+            else:
+                self._maybe_autostart_simp()
+            return
+        if name == "SIM DISABLE":
+            self.ui_mode = "UNSELECTED"
+            self._set_telemetry(False)
+            self._simp_autostart = False
+            self._sim_arm("SIM DISABLE")
+
+    @staticmethod
+    def _order_hint(mode, need):
+        if mode in ("SIM_MODE", "FLIGHT_MODE"):
+            which = "SIM" if mode == "SIM_MODE" else "FLIGHT"
+            return f"{which} mode is active — press {which} DISABLE first"
+        return (f"Press {need} first — sequence: SIM → SIM ENABLE → SIM ACTIVATE, "
+                "or SIM → FLIGHT ENABLE → FLIGHT ACTIVATE")
+
+    def _sim_links(self):
+        """Connected links on the selected radio that SIM ENABLE would use."""
+        return [k for k in (link_key(v, self.up_radio) for v in ("C", "P"))
+                if self.links.is_connected(k)]
+
+    def _request_profile(self, why):
+        self._log(why, "sys")
+        self._emit({"type": "request_profile", "text": why,
+                    "source": self.sim_source})
+
+    def _set_telemetry(self, on, what=""):
+        if on == self.telemetry_on:
+            return
+        self.telemetry_on = on
+        self._gate_noted = False
+        self._log(f"TELEMETRY ON — {what}" if on else
+                  "TELEMETRY OFF — display stopped until the next ACTIVATE", "sys")
+
+    def _maybe_autostart_simp(self):
+        """After SIM ACTIVATE: start the SIMP stream once the payload is armed and a
+        profile is loaded (LINK: armed = MODE 'S' seen in the hardware telemetry)."""
+        if not self._simp_autostart or not self.profile_rows:
+            return
+        if self.simp is not None and self.simp.is_alive():
+            self._simp_autostart = False
+            return
+        if self.sim_source == "LINK":
+            ready = self._any_real_link() and self.sim_state == "ACTIVE"
+        else:
+            ready = self._sim_effectively_active()
+        if not ready:
+            if not self._simp_wait_noted:
+                self._simp_wait_noted = True
+                self._log("SIM ACTIVATE: waiting for MODE=S from the payload "
+                          "before streaming SIMP", "sys")
+            return
+        self._simp_autostart = False
+        self._simp_start()
+
+    # ── ST: set time from the vehicle's GPS or by hand ────────────────────
+    def _vehicle_gps_time(self):
+        """Newest GNSS_TIME the CanSat sent (the PocketQube carries the GNSS)."""
+        d = self.rx_latest.get("P")
+        return hms_seconds(d.get("GNSS_TIME")) if d else None
+
+    def _set_time(self, arg, target):
+        a = str(arg or "").strip().upper()
+        if not a:
+            self._alert("warning", "ST", f"ST needs a value — {ARG_PROMPTS['time']}")
+            return
+        if a == "GPS":
+            sec = self._vehicle_gps_time()
+            if sec is None:
+                self._alert("warning", "ST — GPS",
+                            "No GPS time from the CanSat yet (no PocketQube GNSS_TIME "
+                            "received). Use a manual time (HH:MM:SS) instead.")
+                return
+            source = "GPS"
+        else:
+            sec = hms_seconds(a)
+            if sec is None:
+                self._alert("warning", "ST", f"Not a valid time: {arg}\n"
+                            "Use GPS or HH:MM:SS (UTC)")
+                return
+            source = "MANUAL"
+        hms = hms_text(sec)
+        if not self._dispatch("ST", hms, target, self.up_radio):
+            return
+        self.st_clock = {"source": source, "base": sec, "mono": time.monotonic(),
+                         "vehicle": target}
+        self._log(f"ST: {VEHICLE_TITLE[target]} time set to {hms} UTC "
+                  f"({'GPS time from the vehicle' if source == 'GPS' else 'manual'})",
+                  "sys")
+
+    def _st_clock_now(self):
+        c = self.st_clock
+        if c is None:
+            return None
+        if c["source"] == "GPS":
+            # keep following the vehicle's GPS clock while it reports one
+            sec = self._vehicle_gps_time()
+            if sec is not None and sec != c.get("last_gps"):
+                c["last_gps"] = sec
+                c["base"], c["mono"] = sec, time.monotonic()
+        return c["base"] + (time.monotonic() - c["mono"])
+
+    # ── CAM_SET: relative clockwise rotation, 10° per button press ────────
+    def _cam_set(self, arg, target):
+        a = str(arg if arg is not None else "").replace(",", "").strip()
+        if not a:
+            deg = CAM_STEP_DEG
+        else:
+            try:
+                f = float(a)
+            except ValueError:
+                f = None
+            if f is None or f != int(f) or abs(f) > CAM_ANGLE_MAX:
+                self._alert("warning", "CAM_SET",
+                            f"Camera angle must be a whole number of degrees, "
+                            f"-{CAM_ANGLE_MAX}..{CAM_ANGLE_MAX} (got {arg})")
+                return
+            deg = int(f)
+        if not self._dispatch("CAM_SET", str(deg), target, self.up_radio):
+            return
+        self.cam_total_deg += deg
+        turn = "clockwise" if deg >= 0 else "counter-clockwise"
+        self._log(f"CAM_SET: rotate {abs(deg)}° {turn} "
+                  f"(total {self.cam_total_deg:+d}°)", "sys")
+
+    def _on_sim_source_change(self, want):
+        if want not in SIM_SOURCES:
+            return
+        if self.ui_mode in ("FLIGHT_ENABLED", "FLIGHT_MODE"):
+            self._alert("warning", "SIM source",
+                        "SIM SOURCE is locked in FLIGHT mode — press FLIGHT DISABLE first")
+            return
+        if want == "FILE" and self._any_real_link():
+            self._alert(
+                "warning", "SIM source",
+                "FILE ONLY is unavailable while a real link is connected — "
+                "press Disconnect first (keeps simulated telemetry out of real data)")
+            self.sim_source = "LINK"
+            return
+        self.sim_source = want
+        self._simp_stop(silent=True)
+        if want == "LINK" and self.sim is not None and self.sim.is_alive():
+            self._stop_sim()
+        self.sim_state = "IDLE"
+        self._reset_mission()
+        self._pq_arm_tries = 0
+        self._log("SIM source = " + SIM_SOURCE_LABEL[want], "sys")
+        if self.ui_mode in ("SIM_ENABLED", "SIM_MODE"):
+            # the arming was for the other source — start the SIM path again
+            self.ui_mode = "SIM"
+            self._set_telemetry(False)
+            self._simp_autostart = False
+            self._log("SIM source changed — press SIM ENABLE again", "warn")
+        if want == "LINK":
+            links = self._sim_links()
+            self._log("LINK: CanSat connected via " + ", ".join(links) if links else
+                      "LINK: CanSat not connected — press Connect before SIM ENABLE",
+                      "sys" if links else "warn")
+
+    # ── FSW SEQUENCE: status from telemetry + buttons to uplink mechanisms manually ──
+    def _mech_bit(self, d, bit):
+        m = d.get("_MECH") if d else None
+        return bool(m is not None and (m >> bit) & 1)
+
+    def _sequence(self):
+        dc, dp = self.latest("C"), self.latest("P")
+        ap = self.apo_track[self._src()].apogee
+        alt_c = to_float(dc.get("ALTITUDE")) if dc else None
+        sv = {}
+        sv["apogee"] = (f"✔ APOGEE {ap:.0f} m" if ap is not None
+                        else "… awaiting apogee")
+        if self._mech_bit(dc, C_BIT_PQ_RELEASED):
+            sv["release"] = "✔ PQ separated (switch confirmed)"
+        elif self._mech_bit(dc, C_BIT_MECH_ACTIVE):
+            sv["release"] = "… release commanded, awaiting switch"
+        elif ap is not None:
+            now = f"{alt_c:.0f} m" if alt_c is not None else NONE_TEXT
+            sv["release"] = (f"… FSW releases at 90% = "
+                             f"{APOGEE_RELEASE_FRAC * ap:.0f} m (now {now})")
+        else:
+            sv["release"] = "… awaiting apogee"
+        solar = (self._mech_bit(dp, PQ_BIT_SOLAR_1)
+                 and self._mech_bit(dp, PQ_BIT_SOLAR_2))
+        boom = self._mech_bit(dp, PQ_BIT_BOOM)
+        if dp is None:
+            sv["solar"] = "— PQ not powered up yet"
+        else:
+            sv["solar"] = ("✔ solar deployed" if solar
+                           else "… FSW auto-deploys at T+5 s")
+        if boom:
+            sv["boom"] = "✔ boom deployed"
+        elif solar:
+            sv["boom"] = "▶ ready — press Boom"
+        else:
+            sv["boom"] = "— awaiting solar"
+        if self.cam_turn_seen:
+            sv["cam"] = f"✔ camera rotated (total {self.cam_total_deg:+d}°)"
+        elif boom:
+            sv["cam"] = "▶ ready — press Cam rot"
+        else:
+            sv["cam"] = "— awaiting boom"
+        done = sum(v.startswith("✔") for v in sv.values())
+        pending = next((t for k, t in (("apogee", "apogee"), ("release", "release"),
+                                       ("solar", "solar"), ("boom", "boom"),
+                                       ("cam", "camera"))
+                        if not sv[k].startswith("✔")), None)
+        summary = f"{done}/5" + (f" · next: {pending}" if pending else " · done")
+        can_tx = self._virtual_live() or self._any_real_link()
+        rel_done = self._mech_bit(dc, C_BIT_MECH_ACTIVE)
+        enable = {"release": can_tx and not rel_done,
+                  "boom": can_tx and dp is not None and not boom,
+                  "cam": can_tx and dp is not None}
+        return {"items": sv, "summary": summary, "enable": enable}
+
+    def seq_action(self, action, arg=None):
+        """FSW SEQUENCE buttons (confirmation happens in the browser)."""
+        enable = self._sequence()["enable"]
+        if not enable.get(action):
+            self._alert("warning", "FSW sequence",
+                        f"{action} is not available right now")
+            return
+        if action == "release":
+            self._dispatch("MEC RELEASE ON", None, "C", self.up_radio)
+        elif action == "boom":
+            self._dispatch("BOOM_ON", None, "P", self.up_radio)
+        elif action == "cam":
+            self._cam_set(arg, "P")          # empty arg = one 10° clockwise step
+
+    # ── LINK mode: check FSW results against the values sent + re-arm the PQ ──
+    def _update_hil(self):
+        streaming = self.simp is not None and self.simp.is_alive()
+        exp = getattr(self, "_hil_expected", None)
+        dc = self.latest("C")
+        alt = to_float(dc.get("ALTITUDE")) if dc else None
+        if not streaming or exp is None:
+            self.hil_text = "HIL check —"
+        elif alt is None:
+            self.hil_text = f"sent → expect {exp:.1f} m · awaiting FSW result"
+        else:
+            self.hil_text = (f"expect {exp:.1f} m · FSW {alt:.1f} m · "
+                             f"Δ {alt - exp:+.1f} m")
+        # LINK: the PQ just powered up after release → still MODE F, SIM must be re-armed
+        if (self.sim_source != "LINK" or not streaming):
+            return
+        dp = self.rx_latest.get("P")
+        if not dp:
+            return
+        if str(dp.get("MODE", "")).strip().upper() == "S":
+            self._pq_arm_tries = 0
+            return
+        now = time.time()
+        if (self._pq_arm_tries < PQ_REARM_MAX
+                and now - self._pq_arm_t > PQ_REARM_GAP_S):
+            self._pq_arm_tries += 1
+            self._pq_arm_t = now
+            self._log(f"PQ powered up but MODE=F — re-arming SIM "
+                      f"({self._pq_arm_tries}/{PQ_REARM_MAX})", "warn")
+            self._dispatch("SIM ENABLE", None, "P", self.up_radio,
+                           track_ack=False)
+            self._after(0.7, lambda: self._dispatch(
+                "SIM ACTIVATE", None, "P", self.up_radio,
+                track_ack=False))
+
+    def _any_real_link(self):
+        return any(self.links.is_connected(k) for k in LINK_KEYS)
+
+    def _virtual_live(self):
+        """The virtual payload is usable only when no real link is connected."""
+        return (self.sim is not None and self.sim.is_alive()
+                and self.sim_source == "FILE"
+                and not self._any_real_link())
+
+    def _retire_virtual(self):
+        """Real link connected — stop the virtual payload and clear all simulated data."""
+        if self.sim is None or not self.sim.is_alive():
+            return
+        self._simp_stop(silent=True)
+        self._stop_sim()
+        self._reset_mission()
+        self._log("Real link connected — virtual payload stopped, simulated data cleared "
+                  "(kept out of real telemetry / Flight CSV)", "warn")
+
+    def _ensure_sim_loopback(self, name, key):
+        """Simulation-group commands must be testable without hardware.
+
+        If there is no real link on this path yet, wake the virtual payload as a loopback
+        to receive the command. The simulated payload still enforces the GS16/F6 arming gate
+        itself, and _pressure() stays at AGL = 0 until real SIMP values arrive —
+        so waking the loopback never makes the plots move on their own.
+        Other groups (Flight in particular) do not get this shortcut.
+        """
+        if not is_sim_group_command(name):
+            return
+        # bare SIM (no ENABLE/ACTIVATE/DISABLE) = just the mode-selection gate,
+        # no need to start VirtualPayload yet
+        n = " ".join(str(name or "").upper().split())
+        if n in ("SIM", "SIMP"):
+            return       # SIMP cannot wake it — stops a queued sample reviving the payload after DISABLE
+        if self._any_real_link() or self.sim_source != "FILE":
+            return       # LINK mode / real link present → no simulated telemetry allowed
+        if self.sim is None or not self.sim.is_alive():
+            self._start_sim()
+
+    def _dispatch(self, name, arg, vehicle, radio, track_ack=True, quiet=False):
+        key = link_key(vehicle, radio)
+        wires = wire_commands(name, arg, vehicle)
+        wire = wires[-1]
+        echo = expected_echo(wire)
+        self._ensure_sim_loopback(name, key)
+        sim_live = self._virtual_live()
+        if sim_live:
+            # feed the command into the virtual payload — it enforces the arming gate itself
+            self.sim.command(vehicle, name, arg, echo=echo)
+        if self.links.is_connected(key):
+            for w in wires:
+                self.links.send(key, w)          # one link only
+        elif not sim_live:
+            self._log(f"NOT SENT  {self._cmd_text(name, arg)}: {key} not connected",
+                      "err")
+            self._emit({"type": "cmd", "event": "not_sent", "name": name,
+                        "vehicle": vehicle, "link": key, "wires": wires})
+            return False
+        self._uplinked.update((echo_token(name), echo))
+        self._note_wire(name, vehicle, key, wires)
+        if not quiet:
+            self._log_sent(self._cmd_text(name, arg), vehicle, key)
+            if " ".join(str(name).upper().split()) == "SIM":
+                # bare SIM = mode-selection gate per the minimum command table, no other effect
+                self._log("SIM: continue with SIM ENABLE (simulation) or "
+                          "FLIGHT ENABLE (real flight)", "sys")
+        if track_ack:
+            base = self.rx_latest.get(vehicle)
+            base_count = to_int(base.get("COMMAND_COUNT")) if base else None
+            self.pending_cmd = dict(vehicle=vehicle, name=name, arg=arg,
+                                    radio=radio, link=key,
+                                    token=echo,
+                                    t0=time.time(), base_count=base_count)
+            self.ack_text = (f"Awaiting ACK: {name} → {VEHICLE_NAME[vehicle]} "
+                             f"via {key}")
+        return True
+
+    def send_raw(self, text, vehicle=None):
+        """CMD text box + Send.
+
+        * 'CMD,...' is sent exactly as typed (original free-text behaviour).
+        * Text that starts with a command name from COMMAND_GROUPS ('SIM ENABLE',
+          'FLIGHT ACTIVATE', 'CAM_SET,5', 'ST GPS', 'MEC BOOM,ON') does exactly
+          what its button does (_send_spec): same mode sequence, same target rules.
+          'SIMP <Pa>' still sends that one value.
+        * Anything else falls back to the original free-text path."""
+        txt = str(text or "").strip()
+        if not txt:
+            return
+        vehicle = vehicle if vehicle in ("C", "P") else self.up_target
+        if not txt.upper().startswith("CMD,"):
+            m = match_command_text(txt)
+            if m is not None:
+                spec, rest = m
+                if spec["name"] == "SIMP" and rest:
+                    self._dispatch("SIMP", rest.replace(" ", ""), vehicle, self.up_radio)
+                    return
+                self._send_spec(spec, rest or None, vehicle)
+                return
+        self._send_free_text(txt, vehicle)
+
+    def _send_free_text(self, txt, vehicle):
+        radio = self.up_radio
+        key = link_key(vehicle, radio)
+        wire = txt if txt.upper().startswith("CMD,") else wire_command(txt, None, vehicle)
+        # split the command name + argument out of the typed text to feed the virtual
+        # payload the same way the command buttons do. The 'CMD,<team>,NAME[,ARG]' form
+        # must drop its first two fields, otherwise the command name becomes 'CMD'.
+        parts = [p.strip() for p in txt.split(",")]
+        if txt.upper().startswith("CMD,"):
+            parts = parts[2:]
+        # full name, e.g. 'SIM ENABLE' (never cut to the first word, or the payload's
+        # arming gate sees only 'SIM' and the arm sequence never advances)
+        name = " ".join((parts[0] if parts else "").split())
+        if len(parts) > 1 and name.upper() in ("SIM", "FLIGHT"):
+            name = f"{name} {parts[1]}"          # 'SIM,ENABLE' -> 'SIM ENABLE'
+            arg = ",".join(parts[2:]) or None
+        else:
+            arg = ",".join(parts[1:]) or None
+        self._ensure_sim_loopback(name, key)
+        sim_live = self._virtual_live()
+        if sim_live:
+            self.sim.command(vehicle, name, arg, echo=expected_echo(wire))
+        if self.links.is_connected(key):
+            self.links.send(key, wire)
+        elif not sim_live:
+            self._log(f"NOT SENT  {txt}: {key} not connected", "err")
+            self._emit({"type": "cmd", "event": "not_sent", "name": txt,
+                        "vehicle": vehicle, "link": key, "wires": [wire]})
+            return
+        self._uplinked.update((echo_token(name), expected_echo(wire)))
+        self._note_wire(txt, vehicle, key, [wire])
+        self._log_sent(txt, vehicle, key)
+
+    def _note_wire(self, name, vehicle, key, wires):
+        """Remember + announce exactly what went on air (or into the loopback)."""
+        self.last_wire = {"name": name, "vehicle": vehicle, "link": key,
+                          "wires": wires,
+                          "virtual": not self.links.is_connected(key)}
+        self._emit(dict(self.last_wire, type="cmd", event="sent"))
+
+    @staticmethod
+    def _cmd_text(name, arg=None):
+        return f"{name} {arg}" if arg not in (None, "") else str(name)
+
+    def _log_sent(self, cmd_text, vehicle, key):
+        """SENT line in the event log (replaces the old 'TX [...]' console lines)."""
+        virt = "" if self.links.is_connected(key) else "  [virtual loopback]"
+        self._log(f"SENT  {cmd_text} -> {VEHICLE_TITLE[vehicle]} via {key}{virt}",
+                  "sent")
+
+    @staticmethod
+    def _echo_matches(token, echo):
+        """The FSW may echo only the first word (FLIGHT) or the full name (FLIGHTACTIVATE)."""
+        if not echo or not token:
+            return False
+        return token.startswith(echo) or echo.startswith(token)
+
+    def _try_ack(self, d):
+        """Check whether one packet is the ACK of the pending command."""
+        p = self.pending_cmd
+        if not p or d.get("_VEHICLE") != p["vehicle"]:
+            return False
+        cnt = to_int(d.get("COMMAND_COUNT"))
+        echo = echo_token(str(d.get("CMD_ECHO", "")))
+        counted = cnt is not None and (p["base_count"] is None
+                                       or cnt > p["base_count"])
+        if not (counted and self._echo_matches(p["token"], echo)):
+            return False
+        # The PQ has no MECH_STATE bit for "camera rotated" — the best evidence
+        # is the ACK of the rotate command itself (SIMP overwrites the echo very easily)
+        if p["token"].startswith(CAM_TURN_ECHOES):
+            self.cam_turn_seen = True
+        self.ack_text = (f"ACK {p['name']} — COMMAND_COUNT={cnt}, "
+                         f"CMD_ECHO={d.get('CMD_ECHO')}")
+        self._log(f"ACK  {p['name']} (COMMAND_COUNT={cnt})", "ack")
+        self._emit({"type": "cmd", "event": "ack", "name": p["name"],
+                    "vehicle": p["vehicle"], "link": p["link"],
+                    "command_count": cnt, "cmd_echo": d.get("CMD_ECHO")})
+        self.pending_cmd = None
+        return True
+
+    def _check_pending_cmd(self):
+        p = self.pending_cmd
+        if not p:
+            return
+        d = self.rx_latest.get(p["vehicle"])
+        if d and self._try_ack(d):
+            return
+        if time.time() - p["t0"] > CMD_TIMEOUT_S:
+            self.pending_cmd = None
+            self.ack_text = (f"No ACK for {p['name']} within "
+                             f"{CMD_TIMEOUT_S:.0f} s")
+            self._log(f"NO ACK  {p['name']} via {p['link']}", "warn")
+            self._emit({"type": "cmd", "event": "noack", "name": p["name"],
+                        "vehicle": p["vehicle"], "link": p["link"]})
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  SIMULATION MODE — arming gate + SIMP streaming
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _sim_arm(self, name):
+        """
+        GS16 / F6 — SIM ENABLE first, then SIM ACTIVATE.
+        The SIMP Start button stays disabled until the payload confirms SIM mode.
+        """
+        sent = False
+        for v in ("C", "P"):
+            if self._dispatch(name, None, v, self.up_radio,
+                              track_ack=(v == "C")):
+                sent = True
+        if not sent:
+            return False
+        if name == "SIM DISABLE":
+            self.sim_state = "IDLE"
+            self._simp_stop(silent=True)
+            self._reset_mission()
+            # stop the whole VirtualPayload thread so no fake telemetry follows the disable
+            if self.sim is not None and self.sim.is_alive():
+                self._stop_sim()
+            self._log("SIM: back to FLIGHT mode — everything stopped",
+                      "sys")
+            # the Tk app opened this folder in Finder; a web server only reports it
+            if (os.path.exists(self.csv_paths["C"])
+                    or os.path.exists(self.csv_paths["P"])):
+                self._log(f"CSV folder: {APP_DIR}", "sys")
+        return True
+
+    def _reset_mission(self):
+        """Clean mission reset: both the simulated payload and the GS telemetry buffers."""
+        if self.sim is not None and self.sim.is_alive():
+            self.sim.reset_mission()
+
+        # ── ground-station side — the same values __init__ sets at startup ──
+        for s in DISPLAY_SOURCES:
+            self.latest_src[s] = {"C": None, "P": None}
+            self.history_src[s] = {"C": collections.defaultdict(list),
+                                   "P": collections.defaultdict(list)}
+            self.seen_src[s].clear()
+            self.count_src[s]["C"] = 0
+            self.count_src[s]["P"] = 0
+        # drop virtual events still queued (stops the buffers reviving after the reset)
+        keep = []
+        while True:
+            try:
+                item = self.rx_q.get_nowait()
+            except queue.Empty:
+                break
+            kind, _k, _p, extra = item
+            if (kind == "DATA" and extra == VIRTUAL_TAG) or kind in (
+                    "SIMP_SAMPLE", "MECH_WINDOW"):
+                continue
+            keep.append(item)
+        for item in keep:
+            self.rx_q.put(item)
+        self._reset_altitude_state()
+        self.cam_turn_seen = False
+        self.pq_landed_seen = False
+        self.cam_total_deg = 0
+        self.rx_latest = {"C": None, "P": None}
+        self.pending_cmd = None
+        self.ack_text = "No pending command"
+        for v in ("C", "P"):
+            self.rx_stamps[v].clear()
+            self._last_rx_mono[v] = None
+        self._reset_event_state()
+        self.sim_warn = ""
+        self.simp_stat = "idle"
+        self.simp_rate = f"achieved rate {NONE_TEXT}"
+
+        # ── browsers: back to the empty state seen at program start (the Tk app
+        #    cleared both TELEMETRY LOG boxes and the event log here) ──────────
+        for s in DISPLAY_SOURCES:
+            for v in ("C", "P"):
+                self.telemetry_backlog[s][v].clear()
+        self.event_backlog.clear()
+        self._track = []
+        self._emit({"type": "reset"})
+        self._hil_expected = None
+        self._hil_base_alt = None
+        self._pq_arm_tries = 0
+        self._log("Ground-station mission data reset — ready for a new demo run",
+                  "sys")
+        self.emit_status()
+
+    def _sim_effectively_active(self):
+        """True if really in SIMULATION mode — confirmed by telemetry (real hardware)
+        or by the state VirtualPayload (loopback) confirms itself when there is no real
+        hardware. See the deadlock explanation in _simp_start()."""
+        if self.sim_state == "ACTIVE":
+            return True
+        if self._virtual_live():
+            with self.sim.lock:
+                return any(s == "ACTIVE" for s in self.sim.sim_state.values())
+        return False
+
+    def _sim_state_set(self, new):
+        if SIM_STATE_RANK[new] == SIM_STATE_RANK[self.sim_state]:
+            return
+        self.sim_state = new
+        self._log(f"SIM STATE → {new}", "sys")
+
+    def _update_sim_state_from_telemetry(self):
+        """
+        Advance the arming state only on "evidence from the payload":
+          ENABLED  when CMD_ECHO acknowledges SIM ENABLE
+          ACTIVE   when telemetry MODE becomes 'S' (the strongest evidence)
+        """
+        modes, echoes = [], []
+        for v in ("C", "P"):
+            d = self.rx_latest.get(v)
+            if not d:
+                continue
+            modes.append(str(d.get("MODE", "")).strip().upper())
+            echoes.append(echo_token(str(d.get("CMD_ECHO", ""))))
+        if "S" in modes:
+            self._sim_state_set("ACTIVE")
+        elif self.sim_state == "IDLE" and "SIMENABLE" in echoes:
+            self._sim_state_set("ENABLED")
+
+        # loud warning if streaming while the payload is not really in SIM mode
+        streaming = self.simp is not None and self.simp.is_alive()
+        if streaming and modes and "S" not in modes:
+            self.sim_warn = (
+                "!! MODE is not 'S' while streaming SIMP — the payload is not "
+                "really in SIMULATION mode; this demo run is invalid")
+        elif streaming and self.sim_state == "ACTIVE":
+            self.sim_warn = ""
+        elif not streaming:
+            self.sim_warn = ""
+
+    # ── profile file ──────────────────────────────────────────────────────
+    def load_profile_text(self, name, text):
+        """Profile uploaded from the browser: parsed by the unchanged
+        load_pressure_profile() through a temporary file."""
+        data = str(text or "").encode("utf-8")
+        if len(data) > MAX_PROFILE_BYTES:
+            self._alert("error", "SIMP profile",
+                        f"File too large ({len(data)} bytes)")
+            return False
+        suffix = os.path.splitext(str(name or ""))[1] or ".csv"
+        fd, tmp = tempfile.mkstemp(prefix="simp_profile_", suffix=suffix)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            return self._load_profile(tmp, display_name=str(name or "profile"))
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def _load_profile(self, path, display_name=None):
+        self.simp_path = display_name or path
+        try:
+            info = load_pressure_profile(path)
+        except Exception as e:
+            self._alert("error", "SIMP profile", f"Cannot read file:\n{e}")
+            self.simp_info = f"Cannot read file: {e}"
+            self.profile = self.profile_rows = None
+            return False
+
+        if info["unit"] == "Pa":
+            return self._apply_profile(info, 1.0)
+        if info["unit"] == "UNKNOWN":
+            self._alert(
+                "error", "SIMP profile",
+                "Pressure values in the file are outside the known ranges (Pa / kPa / hPa)\n"
+                f"median found ≈ {statistics.median([v for _, v in info['rows']]):.1f}\n\n"
+                "Must be pascals (≈101325 at sea level) per CTR18 / PQ24")
+            self.profile = self.profile_rows = None
+            return False
+        # kPa / hPa: the operator must confirm the conversion (was messagebox.askyesno)
+        self._pending_convert = info
+        self._emit({
+            "type": "confirm", "id": "profile_convert",
+            "title": "Pressure unit is not Pa",
+            "text": (f"{profile_summary(info)}\n\n"
+                     f"The values look like {info['unit']}, not pascals.\n"
+                     f"The spec requires Pa (resolution 1 Pa, CTR18/PQ24).\n\n"
+                     f"Convert to Pa with factor x{info['factor']:.0f}?\n"
+                     f"(If unsure, press Cancel and check the file first — a wrong unit "
+                     f"conversion invalidates the whole demo run)")})
+        return None
+
+    def resolve_profile_convert(self, accept):
+        info, self._pending_convert = self._pending_convert, None
+        if info is None:
+            return
+        if not accept:
+            self.profile = self.profile_rows = None
+            self.simp_info = "Cancelled — pressure unit not confirmed"
+            return
+        self._apply_profile(info, info["factor"])
+
+    def _apply_profile(self, info, factor):
+        rows = []
+        for txt, val in info["rows"]:
+            pa = val * factor
+            rows.append((str(int(round(pa))), pa))   # 1 Pa resolution
+        self.profile = info
+        self.profile_rows = rows
+        summary = profile_summary(info)
+        self.simp_info = (
+            f"{info['n']} rows · {info['n'] / SIMP_PERIOD_S:.0f} s @1 Hz · "
+            f"{min(r[1] for r in rows):.0f}..{max(r[1] for r in rows):.0f} Pa")
+        self._log("SIMP profile: " + summary.replace("\n", " | "), "sys")
+        return True
+
+    # ── streaming controls ────────────────────────────────────────────────
+    def _simp_uplink(self, raw_v):
+        """Send one SIMP value to both vehicles on the selected radio."""
+        for v in ("C", "P"):
+            self._dispatch("SIMP", raw_v, v, self.up_radio,
+                           track_ack=False, quiet=True)
+
+    def _simp_start(self):
+        # Normally self.sim_state is confirmed only by real telemetry (MODE='S') —
+        # but VirtualPayload (loopback) sends no telemetry at all until a SIMP value
+        # arrives (prevents a fake MODE from the math.sin formulas), causing a deadlock:
+        # SIMP may not start until MODE='S' is seen, yet MODE='S' cannot arrive until
+        # SIMP starts sending. While the loopback is running (no real hardware) we
+        # trust the arm state VirtualPayload confirms itself — that is "evidence
+        # from the payload" too, just from an object in this process instead of
+        # over the radio. Real hardware must still prove it through telemetry only.
+        if self.sim_source == "LINK":
+            if not self._any_real_link():
+                self._alert("warning", "SIMP",
+                            "LINK mode: radio not connected — press Connect first")
+                return
+            if self.sim_state != "ACTIVE":
+                self._alert("warning", "SIMP",
+                            "LINK mode: MODE='S' must first be seen in the "
+                            "hardware telemetry (SIM ENABLE → SIM ACTIVATE, then "
+                            "wait for the hardware to acknowledge)")
+                return
+        if not self._sim_effectively_active():
+            self._alert("warning", "SIMP",
+                        "Cannot stream yet — the payload must be in SIMULATION mode "
+                        "first (SIM ENABLE followed by SIM ACTIVATE)")
+            return
+        if not self.profile_rows:
+            self._alert("warning", "SIMP", "No pressure profile file loaded")
+            return
+        if self.simp is not None and self.simp.is_alive():
+            return
+        self._hil_base_alt = None
+        self._hil_expected = None
+        self._pq_arm_tries = 0
+        self.simp_stop = threading.Event()
+        self.simp = SimpProfileSender(self.profile_rows, self.rx_q,
+                                      self.simp_stop)
+        self.simp.start()
+        self._log(f"SIMP: streaming {len(self.profile_rows)} rows at 1 Hz "
+                  f"via {RADIO_LABEL[self.up_radio]}", "sys")
+
+    def _simp_pause(self):
+        if self.simp is None or not self.simp.is_alive():
+            return
+        if self.simp.paused:
+            self.simp.resume()
+            self._log("SIMP: resume", "sys")
+        else:
+            self.simp.pause()
+            self._log("SIMP: pause", "warn")
+
+    def _simp_stop(self, silent=False):
+        if self.simp is not None:
+            self.simp_stop.set()
+            self.simp = None
+            if not silent:
+                self._log("SIMP: stream stopped", "sys")
+        self.simp_stat = "stopped"
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Packet intake
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _accept(self, key, raw, virtual=False):
+        # virtual packets are not counted in the real link statistics (evidence for the judges)
+        st = (dict(rx=0, dup=0, chk_fail=0, first=0, last_rx=None)
+              if virtual else self.link_stats[key])
+        st["rx"] += 1
+        st["last_rx"] = time.time()
+        _payload, chk = verify_line(raw)
+        if chk == "FAIL":
+            st["chk_fail"] += 1
+            self._log(f"[{key}] checksum fail: {raw[:60]}", "err")
+            return
+        d = parse_packet(raw)
+        if d is None:
+            self._log(f"[{key}] unreadable packet / not team {TEAM_ID}",
+                      "warn")
+            return
+        vehicle = d["_VEHICLE"]
+        expected = self.links.cfg[key]["vehicle"]
+        if vehicle != expected:
+            self._log(f"[{key}] got a {VEHICLE_NAME[vehicle]} packet "
+                      f"on the {VEHICLE_NAME[expected]} link", "warn")
+        self.rx_latest[vehicle] = d
+        if not self.telemetry_on:
+            # mode gate closed: the packet still counts in the link statistics and
+            # still acknowledges commands / proves SIM arming, but is not shown,
+            # plotted or logged until SIM ACTIVATE / FLIGHT ACTIVATE
+            self._try_ack(d)
+            if not self._gate_noted:
+                self._gate_noted = True
+                self._log(f"[{key}] telemetry received but not displayed — start it "
+                          "with SIM → FLIGHT ENABLE → FLIGHT ACTIVATE (or SIM → "
+                          "SIM ENABLE → SIM ACTIVATE)", "warn")
+            return
+
+        radio = self.links.cfg[key]["radio"]
+        dkey = (d.get("ID"), d.get("PACKET_COUNT"))
+
+        # dedupe runs per "display source" — MERGED is the combined dedupe (first copy wins)
+        # (the sources that will take this copy are known up front so the browser
+        #  message can carry them all and still go out at _append_telemetry's slot)
+        accepted = [s for s in ("MERGED", radio) if dkey not in self.seen_src[s]]
+        for src in ("MERGED", radio):
+            seen = self.seen_src[src]
+            if dkey in seen:
+                if src == "MERGED":
+                    st["dup"] += 1
+                continue
+            seen[dkey] = key
+            while len(seen) > SEEN_CACHE_MAX:
+                seen.popitem(last=False)
+            self.count_src[src][vehicle] += 1
+            self.latest_src[src][vehicle] = d
+            self._append_history(src, vehicle, d)
+            self._track_altitude(src, vehicle, d)
+            if src == "MERGED":
+                st["first"] += 1          # this link delivered the first copy
+                # GS13: write to file only from the same source the log was started with
+                # (real log = real packets only, simulated log = separate SIM_ file)
+                if bool(virtual) == self.log_is_sim:
+                    self._write_csv(vehicle, d)
+                self._note_rx(vehicle)              # each (ID, PACKET_COUNT) once
+                self._broadcast_telemetry(key, vehicle, d, accepted, virtual)
+                self._try_ack(d)    # every packet — SIMP can overwrite the echo
+                self._track_events(vehicle, d)      # STATE lines + uplink reminders
+        if accepted and "MERGED" not in accepted:
+            # second copy, only new to its own band's display source
+            self._broadcast_telemetry(key, vehicle, d, accepted, virtual)
+
+    def _broadcast_telemetry(self, key, vehicle, d, sources, virtual):
+        """One packet -> every browser, immediately (was: _append_telemetry into
+        the TELEMETRY LOG box + the live packet table). `sources` = the display
+        sources that accepted this copy; a browser shows it only if its selected
+        source is among them."""
+        fields = CONTAINER_FIELDS if vehicle == "C" else PQ_FIELDS
+        alt = to_float(d.get("ALTITUDE"))
+        # the point _track_altitude just appended to the ALTITUDE tab series
+        series = self.alt_series[sources[0]][vehicle]
+        alt_pt = list(series[-1]) if alt is not None and series else None
+        msg = {"type": "telemetry", "vehicle": vehicle, "link": key,
+               "sources": sources, "virtual": bool(virtual),
+               "recv": d.get("_RECV_TIME"), "checksum": d.get("_CHECKSUM"),
+               "packet_count": str(d.get("PACKET_COUNT", NONE_TEXT)),
+               # TELEMETRY LOG line (GCSApp._append_telemetry)
+               "text": telemetry_text(vehicle, d),
+               # live packet table cells (PacketTable._value)
+               "values": packet_values(vehicle, d),
+               # GS3 / GS5 values (field_text) + IMAGE_STAB / SCIENCE_EXP
+               "display": [field_text(d, f) for f in fields],
+               "extra": [str(e) for e in (d.get("_EXTRA") or [])],
+               # one history row (GCSApp._append_history) for the TracePlots
+               "num": [_finite(to_float(d.get(f))) for f in HISTORY_FIELDS[vehicle]],
+               "alt_pt": ([_finite(alt_pt[0]), _finite(alt_pt[1])]
+                          if alt_pt else None)}
+        for s in sources:
+            self.telemetry_backlog[s][vehicle].append(msg)
+        self._emit(msg)
+
+    # ── event log: state changes + telemetry-driven uplink reminders ─────
+    def _reset_event_state(self):
+        """Per-mission event-log memory; cancels pending reminder timers."""
+        for k, handle in self._remind_after.items():
+            if handle is not None:
+                try:
+                    handle.cancel()
+                except Exception:
+                    pass
+            self._remind_after[k] = None
+        self._prev_state = {"C": None, "P": None}
+        self._solar_seen = False
+        self._boom_seen = False
+        self._remind_done = {"BOOM": False, "CAM": False}
+        self._uplinked = set()       # echo tokens of commands sent this mission
+
+    def _track_events(self, vehicle, d):
+        """Per deduped (MERGED) packet: log derived-state changes and arm the
+        uplink reminders from MECH_STATE evidence (works on real hardware)."""
+        if vehicle == "C":
+            state = str(d.get("STATE") or "").strip().upper() or None
+        else:
+            if echo_token(str(d.get("CMD_ECHO", ""))).startswith(CAM_TURN_ECHOES):
+                self.cam_turn_seen = True
+            state = pq_state_from_packet(d, self.cam_turn_seen,
+                                         self.pq_landed_seen)
+            if state == "LANDED":
+                self.pq_landed_seen = True    # latch, same rule as the display
+            m = d.get("_MECH")
+            if m is not None:
+                solar = bool((m >> PQ_BIT_SOLAR_1) & 1 or (m >> PQ_BIT_SOLAR_2) & 1)
+                if solar and not self._solar_seen:
+                    self._solar_seen = True
+                    self._arm_reminder("BOOM")
+                if (m >> PQ_BIT_BOOM) & 1 and not self._boom_seen:
+                    self._boom_seen = True
+                    self._arm_reminder("CAM")
+        prev = self._prev_state[vehicle]
+        if state and state != prev:
+            self._prev_state[vehicle] = state
+            self._log(f"STATE  {VEHICLE_TITLE[vehicle]}: "
+                      f"{prev or '(none)'} -> {state}", "state")
+
+    def _arm_reminder(self, which):
+        if self._remind_done[which] or self._remind_after[which] is not None:
+            return
+        self._remind_after[which] = self._after(
+            UPLINK_REMIND_DELAY_S, lambda: self._fire_reminder(which))
+
+    def _fire_reminder(self, which):
+        """One reminder per mission: BOOM_ON 5 s after solar deploy, CAM_SET 5 s
+        after boom deploy — skipped if already done/sent."""
+        self._remind_after[which] = None
+        if self._remind_done[which]:
+            return
+        self._remind_done[which] = True
+        dp = self.latest_src["MERGED"].get("P")
+        if which == "BOOM":
+            if (self._mech_bit(dp, PQ_BIT_BOOM) or self._boom_seen
+                    or any("BOOMON" in t for t in self._uplinked)):
+                return
+            cmd, after = "BOOM_ON", "solar deploy"
+        else:
+            if (self.cam_turn_seen
+                    or any(t.startswith(CAM_TURN_ECHOES) for t in self._uplinked)):
+                return
+            cmd, after = "CAM_SET", "boom deploy"
+        msg = (f"ALERT  Time to uplink {cmd} "
+               f"({UPLINK_REMIND_DELAY_S:.0f} s after {after})")
+        self._log(msg, "alert")
+        if self.pending_cmd is None:
+            self.ack_text = msg
+
+    def _append_history(self, src, vehicle, d):
+        h = self.history_src[src][vehicle]
+        fields = CONTAINER_FIELDS if vehicle == "C" else PQ_FIELDS
+        for f in fields:
+            if f in ("ID", "MODE", "STATE", "CMD_ECHO", "MECH_STATE",
+                     "GNSS_TIME"):
+                continue
+            h[f].append(to_float(d.get(f)))
+            if len(h[f]) > CHART_POINTS * 3:
+                del h[f][:-CHART_POINTS]
+
+    # ── CSV (GS13) ────────────────────────────────────────────────────────
+    def _toggle_log(self):
+        if self.logging:
+            self._stop_log()
+        else:
+            self._start_log()
+
+    def _start_log(self):
+        # if the virtual payload is running → log to separate SIM_ files, never touch Flight_*.csv
+        self.log_is_sim = self.sim is not None and self.sim.is_alive()
+        paths = self.csv_paths_sim if self.log_is_sim else self.csv_paths
+        try:
+            f = open(paths["C"], "w", newline="", encoding="utf-8")
+            w = csv.writer(f)
+            w.writerow(CONTAINER_FIELDS)
+            self.csv_files["C"], self.csv_writers["C"] = f, w
+
+            f = open(paths["P"], "w", newline="", encoding="utf-8")
+            w = csv.writer(f)
+            self.csv_files["P"], self.csv_writers["P"] = f, w
+            self.pq_extra_cols = None     # header written on the first PQ packet
+        except Exception as e:
+            self._alert("error", "CSV", f"Cannot open file: {e}")
+            self._stop_log(silent=True)
+            return
+        self.logging = True
+        self._log(f"CSV logging → {os.path.basename(paths['C'])} , "
+                  f"{os.path.basename(paths['P'])}"
+                  + ("  (SIMULATED data)" if self.log_is_sim else ""), "sys")
+
+    def _stop_log(self, silent=False):
+        self.logging = False
+        # GS13: the file must always have a header, even if no PQ packet ever arrived
+        if self.csv_writers.get("P") is not None and self.pq_extra_cols is None:
+            try:
+                self.csv_writers["P"].writerow(
+                    PQ_FIELDS + extra_column_names(IMAGE_STAB_FIELD_COUNT + 1))
+            except Exception:
+                pass
+        for v in ("C", "P"):
+            fh = self.csv_files.get(v)
+            if fh:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            self.csv_files[v] = None
+            self.csv_writers[v] = None
+        if not silent:
+            self._log("CSV logging stopped", "sys")
+
+    def _write_csv(self, vehicle, d):
+        if not self.logging:
+            return
+        w = self.csv_writers.get(vehicle)
+        fh = self.csv_files.get(vehicle)
+        if w is None or fh is None:
+            return
+        try:
+            if vehicle == "C":
+                w.writerow([d.get(f, "") for f in CONTAINER_FIELDS])
+            else:
+                extras = d.get("_EXTRA", [])
+                if self.pq_extra_cols is None:
+                    self.pq_extra_cols = len(extras)
+                    w.writerow(PQ_FIELDS + extra_column_names(self.pq_extra_cols))
+                row = [d.get(f, "") for f in PQ_FIELDS]
+                if len(extras) != self.pq_extra_cols:
+                    self._log(f"PQ trailing fields = {len(extras)} "
+                              f"(header = {self.pq_extra_cols}) — row length adjusted",
+                              "warn")
+                    extras = (extras + [""] * self.pq_extra_cols)[:self.pq_extra_cols]
+                w.writerow(row + extras)
+            fh.flush()
+        except Exception as e:
+            self._log(f"CSV write error: {e}", "err")
+
+    def history_csv(self, vehicle):
+        """'Save Log Container / PQ': the vehicle's current history as CSV text
+        (was written to a file chosen in a save dialog; now downloaded by the
+        browser). Returns (filename, text) or None if there is no data yet."""
+        default_name = f"log_{TEAM_ID}{'C' if vehicle == 'C' else 'P'}.csv"
+        fields = CONTAINER_FIELDS if vehicle == "C" else PQ_FIELDS
+        hist = self.history(vehicle)
+        if not hist or not any(hist.values()):
+            return None
+        # build rows from history, taking values by packet-order index
+        n = max((len(v) for v in hist.values()), default=0)
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(fields)
+        for i in range(n):
+            row = []
+            for fld in fields:
+                vals = hist.get(fld, [])
+                row.append(vals[i] if i < len(vals) else "")
+            w.writerow(row)
+        self._log(f"Save Log {vehicle}: {default_name}", "sys")
+        return default_name, buf.getvalue()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Poll loop
+    # ══════════════════════════════════════════════════════════════════════
+
+    def pump(self):
+        """Drain the queue once and refresh the derived state."""
+        n = 0
+        while n < 400:
+            try:
+                kind, key, payload, extra = self.rx_q.get_nowait()
+            except queue.Empty:
+                break
+            n += 1
+            if kind == "DATA":
+                self._accept(key, payload, virtual=(extra == VIRTUAL_TAG))
+            elif kind == "STATUS":
+                if key and extra is not None:
+                    self.link_stats[key]["connected"] = bool(extra)
+                    self.link_stats[key]["status"] = payload
+                self._log(f"{key + ': ' if key else ''}{payload}", "sys")
+            elif kind == "TX":
+                # bytes actually written to the serial port by LinkReader
+                self._emit({"type": "tx", "link": key, "wire": payload})
+            elif kind == "MECH_WINDOW":
+                self._on_mech_window(payload)
+            elif kind == "SIMP_SAMPLE":
+                self._on_simp_sample(payload)
+            elif kind == "MAP_CACHE":
+                self._on_map_cache(payload)
+            elif kind == "SIMP_DONE":
+                self._log(payload, "sys")
+                self.simp_stat = payload
+        self._refresh_derived()
+        self._check_pending_cmd()
+        return n
+
+    def _on_simp_sample(self, s):
+        # fire the SIMP command here — on the loop thread only
+        if s.get("wire_value") is not None:
+            self._simp_uplink(s["wire_value"])
+        alt = s.get("altitude")
+        if alt is not None:
+            if self._hil_base_alt is None:
+                self._hil_base_alt = alt          # first row = ground level (implicit CAL)
+            self._hil_expected = alt - self._hil_base_alt
+        self.simp_stat = (f"row {s['row']}/{s['total']} · {s['pressure']:.0f} Pa → "
+                          f"{show(alt, 1)} m")
+        if s.get("hz"):
+            self.simp_rate = (f"{s['hz']:.4f} Hz (last {SIMP_RATE_WINDOW}) · drift "
+                              f"{s['cum_drift'] * 1000:+.0f} ms")
+
+    def _on_mech_window(self, payload):
+        """MECH_WINDOW — VirtualPayload (sim only) reports its uplink window on
+        the sim clock. The operator reminder comes from telemetry
+        (_track_events / _fire_reminder), so this logs nothing; it only arms the
+        BOOM auto-fire fail-safe. CAM has no fail-safe, so CAM windows are ignored."""
+        mech = payload.get("mech")
+        auto_after_s = payload.get("auto_after_s")
+        if mech == "BOOM" and auto_after_s is not None:
+            self._after(auto_after_s, self._boom_autofire_check)
+
+    def _boom_autofire_check(self):
+        """Check after the BOOM_ON uplink window: if the operator has not pressed it,
+        fire it automatically through the normal path (_dispatch) as a fail-safe, as the FSW does."""
+        if self.sim is None or not self.sim.is_alive():
+            return
+        with self.sim.lock:
+            already_sent = self.sim.boom_cmd_sent
+        if already_sent:
+            return
+        self._log("AUTO: BOOM_ON not pressed in time — sending automatically", "warn")
+        self._dispatch("BOOM_ON", None, "P", self.up_radio,
+                       track_ack=True, quiet=False)
+
+    def set_display_source(self, value):
+        if value not in DISPLAY_SOURCES or value == self.display_source:
+            return
+        self.display_source = value
+        self._log(f"Display source: {DISPLAY_SOURCE_LABEL[self._src()]}", "sys")
+        # the browsers clear their plots/log and re-fill from this source's backlog
+        self._emit(self.snapshot())
+
+    def _refresh_derived(self):
+        """The non-widget half of _refresh_display."""
+        self._update_sim_state_from_telemetry()
+        dp = self.latest("P")
+        if dp:
+            if echo_token(str(dp.get("CMD_ECHO", ""))).startswith(CAM_TURN_ECHOES):
+                self.cam_turn_seen = True
+            alt_p = to_float(dp.get("ALTITUDE"))
+            if alt_p is not None and alt_p <= PQ_LANDED_ALT_M:
+                self.pq_landed_seen = True
+            # GCSApp._update_map: track of the displayed PQ GNSS fix
+            lat = to_float(dp.get("GNSS_LATITUDE"))
+            lon = to_float(dp.get("GNSS_LONGITUDE"))
+            if lat is not None and lon is not None:
+                if not self._track or self._track[-1] != (lat, lon):
+                    self._track.append((lat, lon))
+                if len(self._track) > MAP_TRACK_MAX:
+                    del self._track[:-MAP_TRACK_MAX]
+        self._update_hil()
+        self._maybe_autostart_simp()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Snapshots for the browser
+    # ══════════════════════════════════════════════════════════════════════
+
+    def status(self):
+        now = time.time()
+        src = self._src()
+        conn = [k for k in LINK_KEYS if self.links.is_connected(k)]
+        sim_live = self.sim is not None and self.sim.is_alive()
+        if conn:
+            conn_text, conn_level = f"CONNECTED ({len(conn)}/4)", "ok"
+        elif sim_live:
+            conn_text, conn_level = "VIRTUAL CANSAT (loopback)", "accent"
+        else:
+            conn_text, conn_level = "DISCONNECTED", "err"
+
+        links = {}
+        for k in LINK_KEYS:
+            st = self.link_stats[k]
+            c = self.links.cfg[k]
+            connected = self.links.is_connected(k) or st["connected"]
+            age = None if st["last_rx"] is None else now - st["last_rx"]
+            links[k] = dict(
+                connected=bool(connected),
+                state="connected" if connected else st["status"],
+                rx=st["rx"], dup=st["dup"], chk_fail=st["chk_fail"],
+                first=st["first"], age=_finite(age),
+                stale=age is not None and age > STALE_LINK_S,
+                port=c.get("port", ""), baud=c["baud"],
+                channel=str(c.get("channel", "")),
+                ident=str(c.get(self._ident_key(k), "")))
+
+        dc, dp = self.latest("C"), self.latest("P")
+        ap = self.apo_track[src].apogee
+        streaming = self.simp is not None and self.simp.is_alive()
+        st_now = self._st_clock_now()
+        veh_gps = self._vehicle_gps_time()
+        if st_now is not None:
+            gps = (f"GPS TIME  {hms_text(st_now)} UTC  "
+                   f"[ST {self.st_clock['source']}]")
+        elif dp:
+            gps = f"GPS  {parse_gnss_time(dp.get('GNSS_TIME'))}"
+        else:
+            gps = f"GPS TIME {NONE_TEXT}"
+        if dp:
+            lat = to_float(dp.get("GNSS_LATITUDE"))
+            lon = to_float(dp.get("GNSS_LONGITUDE"))
+            gnss = (f"LAT {show(lat, 6)}  LON {show(lon, 6)}  "
+                    f"SATS {show(dp.get('GNSS_SATS'))}")
+        else:
+            gnss = f"LAT {NONE_TEXT}  LON {NONE_TEXT}  SATS {NONE_TEXT}"
+        p = self.pending_cmd
+        return {
+            "type": "status",
+            "display_source": src,
+            "conn": {"text": conn_text, "level": conn_level},
+            "links": links,
+            "counts": dict(self.count_src[src]),
+            "rates": self._rates(),
+            "gps": gps,
+            "gnss": gnss,
+            "vehicle_gps_time": (hms_text(veh_gps) if veh_gps is not None else None),
+            "telemetry_on": self.telemetry_on,
+            "cam_total_deg": self.cam_total_deg,
+            "states": {
+                "C": (str(dc.get("STATE") or "").strip().upper() or None) if dc else None,
+                "P": (pq_state_from_packet(dp, self.cam_turn_seen,
+                                           self.pq_landed_seen) if dp else None)},
+            "mech": {"C": dc.get("_MECH") if dc else None,
+                     "P": dp.get("_MECH") if dp else None},
+            "apogee": _finite(ap),
+            "release_alt": _finite(APOGEE_RELEASE_FRAC * ap) if ap is not None else None,
+            "pq_timer": self._pq_timer(),
+            "sequence": self._sequence(),
+            "uplink": {"radio": self.up_radio, "target": self.up_target,
+                       "link": self._selected_link()},
+            "ack": self.ack_text,
+            "pending": (None if not p else
+                        {"name": p["name"], "vehicle": p["vehicle"],
+                         "link": p["link"]}),
+            "last_wire": self.last_wire,
+            "sim": {
+                "ui_mode": self.ui_mode,
+                "badge": (UI_MODE_TEXT.get(self.ui_mode, "MODE: NaN")
+                          + f"  [{self.sim_source}]"),
+                "badge_level": UI_MODE_LEVEL.get(self.ui_mode, "idle"),
+                "arm_state": self.sim_state,
+                "arm_text": SIM_STATE_TEXT[self.sim_state],
+                "source": self.sim_source,
+                "link_text": self._sim_link_text(),
+                "virtual": sim_live,
+                "virtual_live": self._virtual_live(),
+                "streaming": streaming,
+                "paused": bool(streaming and self.simp.paused),
+                "can_start": bool(self._sim_effectively_active()
+                                  and self.profile_rows and not streaming),
+                "warn": self.sim_warn,
+                "simp_stat": self.simp_stat,
+                "simp_rate": self.simp_rate,
+                "hil": self.hil_text,
+                "profile_info": self.simp_info,
+                "profile_name": os.path.basename(self.simp_path) if self.simp_path else "",
+                "profile_loaded": bool(self.profile_rows),
+            },
+            "logging": {"on": self.logging, "sim": self.log_is_sim,
+                        "files": [os.path.basename(p_) for p_ in
+                                  (self.csv_paths_sim if self.log_is_sim
+                                   else self.csv_paths).values()]},
+            "warns": self.validate_warns,
+            "serial_ok": SERIAL_OK,
+            # live packet table staleness (GCSApp._refresh_display → set_stale)
+            "pkt_age": {v: (None if self._last_rx_mono[v] is None
+                            else _finite(time.monotonic() - self._last_rx_mono[v]))
+                        for v in ("C", "P")},
+            "map": {"mode": self.map_mode, "tiles": self.map_tiles,
+                    "status": self._map_status_text(),
+                    "pt": list(self._track[-1]) if self._track else None,
+                    "cache": self.cache_job},
+        }
+
+    def _sim_link_text(self):
+        """SIM SOURCE = LINK: is the CanSat connected on the selected radio?"""
+        if self.sim_source != "LINK":
+            return ""
+        links = self._sim_links()
+        if links:
+            return "LINK: CanSat connected · " + ", ".join(links)
+        return f"LINK: CanSat NOT connected ({RADIO_LABEL[self.up_radio]}) — press Connect"
+
+    def _map_status_text(self):
+        """GCSApp._init_map status line."""
+        tiles = self.map_tiles
+        if self.map_mode == "OFFLINE":
+            if not tiles:
+                return "map error: No tile cache yet — press CACHE MAP first"
+            return f"OFFLINE · cache {tiles} tiles"
+        return "ONLINE" + (f" · cache {tiles} tiles" if tiles else " · no cache yet")
+
+    def snapshot(self):
+        """Sent to a browser when it connects and to all after a source change."""
+        src = self._src()
+        hist = {}
+        for v in ("C", "P"):
+            h = self.history_src[src][v]
+            hist[v] = [[_finite(x) for x in h.get(f, [])[-CHART_POINTS:]]
+                       for f in HISTORY_FIELDS[v]]
+        return {"type": "snapshot", "display_source": src,
+                "rows": {v: list(self.telemetry_backlog[src][v]) for v in ("C", "P")},
+                "history": hist,
+                "alt_series": {v: [[_finite(x), _finite(a)]
+                                   for x, a in self.alt_series[src][v]]
+                               for v in ("C", "P")},
+                "track": [list(p) for p in self._track],
+                "events": list(self.event_backlog),
+                "status": self.status()}
+
+    def config(self):
+        return web_config(self.links.cfg, self._list_ports())
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Browser messages
+    # ══════════════════════════════════════════════════════════════════════
+
+    def handle_message(self, msg):
+        """One JSON message from a browser (see README for the schema)."""
+        t = msg.get("type")
+        if t == "command":
+            self.send_command(msg.get("name"), msg.get("arg"), msg.get("vehicle"))
+        elif t == "raw":
+            self.send_raw(msg.get("text"), msg.get("vehicle"))
+        elif t == "uplink":
+            self.set_uplink(msg.get("radio"), msg.get("target"))
+        elif t == "display_source":
+            self.set_display_source(msg.get("value"))
+        elif t == "link":
+            self._link_message(msg)
+        elif t == "virtual":
+            if msg.get("action") == "start":
+                self._start_sim()
+            elif msg.get("action") == "stop":
+                self._stop_virtual()
+        elif t == "sim_source":
+            self._on_sim_source_change(msg.get("value"))
+        elif t == "profile":
+            self.load_profile_text(msg.get("name"), msg.get("text"))
+        elif t == "profile_convert":
+            self.resolve_profile_convert(bool(msg.get("accept")))
+        elif t == "simp":
+            a = msg.get("action")
+            if a == "start":
+                self._simp_start()
+            elif a == "pause":
+                self._simp_pause()
+            elif a == "stop":
+                self._simp_stop()
+        elif t == "csv_log":
+            if bool(msg.get("on")) != self.logging:
+                self._toggle_log()
+        elif t == "seq":
+            self.seq_action(msg.get("action"), msg.get("arg"))
+        elif t == "map_mode":
+            self._toggle_map_mode()
+        elif t == "map_cache":
+            if msg.get("action") == "start":
+                self.map_cache_start(msg.get("lat"), msg.get("lon"),
+                                     msg.get("radius"), msg.get("z0"), msg.get("z1"))
+            elif msg.get("action") == "cancel":
+                self.map_cache_cancel()
+        else:
+            return
+        self.emit_status()
+
+    def _link_message(self, msg):
+        a = msg.get("action")
+        key = msg.get("key")
+        self._pull_cfg(msg.get("cfg"))
+        if a in ("connect", "disconnect") and key in LINK_KEYS:
+            if (a == "connect") != self.links.is_connected(key):
+                self._toggle_link(key)
+        elif a == "connect_all":
+            self._connect_all()
+        elif a == "disconnect_all":
+            self._disconnect_all()
+        elif a == "refresh_ports":
+            self._refresh_ports()
+        elif a == "validate":
+            self._validate_and_report()
+        elif a == "save_config":
+            self._save_config()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Simulator / shutdown
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _start_sim(self):
+        if self.sim is not None and self.sim.is_alive():
+            return
+        if self.sim_source != "FILE":
+            self._log("Virtual CanSat not started — in LINK mode", "warn")
+            return
+        if self._any_real_link():
+            self._log("Virtual CanSat not started — a real link is connected "
+                      "(disconnect first to simulate)", "warn")
+            return
+        self.sim_stop = threading.Event()
+        self.sim = VirtualPayload(self.rx_q, self.sim_stop, speed=self.sim_speed)
+        self.sim.start()
+        self._log("Virtual CanSat: started as a loopback — "
+                  "the SIMP values we send are fed back into the simulated payload", "sys")
+
+    def _stop_sim(self):
+        self.sim_stop.set()
+        self.sim = None
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Map — MAP: ONLINE/OFFLINE + CACHE MAP (GCSApp._toggle_map_mode,
+    #  _cache_map_dialog). The browser draws the map; the server owns the cache.
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _toggle_map_mode(self):
+        self.map_tiles = map_cache_tile_count()
+        new = "OFFLINE" if self.map_mode == "ONLINE" else "ONLINE"
+        if new == "OFFLINE" and not self.map_tiles:
+            self._alert("warning", "MAP OFFLINE",
+                        "No tile cache yet — press CACHE MAP while online first")
+            return
+        self.map_mode = new
+        self._log(f"MAP MODE → {new}", "sys")
+
+    def map_cache_start(self, lat, lon, radius, z0, z1):
+        if self.cache_job and self.cache_job.get("running"):
+            return
+        try:
+            c_lat, c_lon = float(lat), float(lon)
+            r = abs(float(radius))
+            z0, z1 = int(z0), int(z1)
+        except (TypeError, ValueError):
+            self._alert("error", "Cache Map", "Invalid input")
+            return
+        if z1 < z0:
+            z0, z1 = z1, z0
+        if not (0 <= z0 <= 22 and 0 <= z1 <= 22):
+            self._alert("error", "Cache Map", "Zoom must be between 0 and 22")
+            return
+        self.cache_cancel.clear()
+        levels = list(range(z0, z1 + 1))
+        self.cache_job = {"running": True, "stat": "", "value": 0,
+                          "max": len(levels)}
+        threading.Thread(target=self._map_cache_work,
+                         args=(c_lat, c_lon, r, levels), daemon=True).start()
+
+    def map_cache_cancel(self):
+        if self.cache_job and self.cache_job.get("running"):
+            self.cache_cancel.set()
+            self.cache_job["stat"] = ("Cancelling — will stop after the current "
+                                      "zoom level…")
+            self._emit(dict(self.cache_job, type="map_cache"))
+
+    @staticmethod
+    def _fetch_tile(z, x, y):
+        url = (MAP_TILE_SERVER.replace("{x}", str(x)).replace("{y}", str(y))
+               .replace("{z}", str(z)))
+        req = urllib.request.Request(url, headers={"User-Agent": "TkinterMapView"})
+        try:
+            with urllib.request.urlopen(req, timeout=MAP_CACHE_TIMEOUT_S) as resp:
+                return resp.read() or None
+        except Exception:
+            return None
+
+    def _map_cache_work(self, c_lat, c_lon, r, levels):
+        """Worker thread: talks to the loop only through rx_q (kind MAP_CACHE)."""
+        def put(**kw):
+            self.rx_q.put(("MAP_CACHE", None, kw, None))
+        failed = 0
+        try:
+            con = sqlite3.connect(MAP_DB_PATH, timeout=10)
+            try:
+                for q in (SQL_MAP_SERVER_TABLE, SQL_MAP_TILES_TABLE,
+                          SQL_MAP_SECTIONS_TABLE):
+                    con.execute(q)
+                con.execute(SQL_MAP_SERVER_INSERT, (MAP_TILE_SERVER, 22))
+                con.commit()
+                for i, z in enumerate(levels):
+                    if self.cache_cancel.is_set():
+                        break
+                    put(stat=f"Downloading zoom {z} …", value=i)
+                    xa, ya = _tile_xy(c_lat + r, c_lon - r, z)
+                    xb, yb = _tile_xy(c_lat - r, c_lon + r, z)
+                    tasks = [(z, x, y)
+                             for x in range(math.floor(xa), math.ceil(xb) + 1)
+                             for y in range(math.floor(ya), math.ceil(yb) + 1)
+                             if con.execute(SQL_MAP_TILE_EXISTS,
+                                            (z, x, y, MAP_TILE_SERVER)).fetchone() is None]
+                    with concurrent.futures.ThreadPoolExecutor(MAP_CACHE_WORKERS) as ex:
+                        for (tz, tx, ty), data in zip(
+                                tasks, ex.map(lambda t: self._fetch_tile(*t), tasks)):
+                            if data:
+                                con.execute(SQL_MAP_TILE_INSERT,
+                                            (tz, tx, ty, MAP_TILE_SERVER, data))
+                            else:
+                                failed += 1
+                    con.commit()
+                    put(value=i + 1)
+            finally:
+                con.close()
+            done = "cancelled" if self.cache_cancel.is_set() else "done"
+            tiles = map_cache_tile_count()
+            extra = f" ({failed} tiles failed to download)" if failed else ""
+            put(stat=f"{done} — cache holds {tiles} tiles{extra}", done=done,
+                tiles=tiles, finished=True)
+        except Exception as e:
+            put(stat=f"cache error: {e}", error=str(e), finished=True)
+
+    def _on_map_cache(self, p):
+        job = self.cache_job or {"running": False, "stat": "", "value": 0, "max": 0}
+        for k in ("stat", "value"):
+            if k in p:
+                job[k] = p[k]
+        if p.get("finished"):
+            job["running"] = False
+            self.map_tiles = map_cache_tile_count()
+            if "error" in p:
+                self._log(f"cache error: {p['error']}", "err")
+            else:
+                self._log(f"cache map {p['done']} → {MAP_DB_PATH} "
+                          f"({p['tiles']} tiles)", "sys")
+        self.cache_job = job
+        self._emit(dict(job, type="map_cache"))
+
+    def _stop_virtual(self):
+        """Stop button for the virtual payload: same clean-up as _retire_virtual."""
+        if self.sim is None or not self.sim.is_alive():
+            return
+        self._simp_stop(silent=True)
+        self._stop_sim()
+        self._reset_mission()
+        self._log("Virtual CanSat: stopped, simulated data cleared", "sys")
+
+    def shutdown(self):
+        """Idempotent: stop CSV logging, VirtualPayload, SimpProfileSender,
+        the link readers and the asyncio tasks."""
+        if self._shut_down:
+            return
+        self._shut_down = True
+        self._stop_log(silent=True)
+        self.cache_cancel.set()
+        self.sim_stop.set()
+        self.simp_stop.set()
+        for th in (self.sim, self.simp):
+            if th is not None and th.is_alive():
+                th.join(timeout=1.0)        # both wake on their stop event
+        self.links.shutdown()
+        for task in self._tasks:
+            task.cancel()
+        for handle in self._remind_after.values():
+            if handle is not None:
+                handle.cancel()
